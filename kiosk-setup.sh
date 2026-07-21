@@ -149,7 +149,7 @@ fi
 
 URLBASE="rtsp://${NVR_USER}:${NVR_PASS_ENC}@${NVR_IP}:${NVR_PORT}/cam/realmonitor"
 
-MPV_COMMON='--fs --no-osc --no-input-default-bindings --really-quiet \
+MPV_COMMON='--fs --no-osc --no-input-default-bindings --no-keepaspect --really-quiet \
       --hwdec=auto --profile=low-latency --rtsp-transport=tcp'
 
 case $LAYOUT in
