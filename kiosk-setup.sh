@@ -293,7 +293,10 @@ EOF
 
   systemctl daemon-reload
   systemctl disable getty@tty1.service 2>/dev/null || true
-  systemctl enable --now kiosk-agent kiosk-display
+  systemctl enable kiosk-agent kiosk-display
+  # restart (not enable --now): on upgrade re-runs the services are already
+  # running old code and must pick up the freshly installed files
+  systemctl restart kiosk-agent kiosk-display
 
   log "Waiting for registration with the manager (up to 60s)..."
   REGISTERED=""
@@ -348,7 +351,9 @@ EOF
 
   systemctl daemon-reload
   systemctl disable getty@tty1.service 2>/dev/null || true
-  systemctl enable --now kiosk-ssh-keys.timer kiosk-display
+  systemctl enable kiosk-ssh-keys.timer kiosk-display
+  # restart (not enable --now): upgrade re-runs must load freshly installed files
+  systemctl restart kiosk-ssh-keys.timer kiosk-display
 
   /usr/local/sbin/kiosk-update-ssh-keys \
     || warn "Initial SSH key import failed - check $SSH_KEYS_URL (timer retries hourly)."
