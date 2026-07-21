@@ -254,6 +254,27 @@ EOF
   fetch_file agent/kiosk-trigger /usr/local/sbin/kiosk-trigger 755
   fetch_file agent/kiosk-agent.service /etc/systemd/system/kiosk-agent.service 644
 
+  # Instant sync: the manager SSHes in as $KIOSK_USER and may run exactly one
+  # command as root - the sync trigger. Validated before install so a bad rule
+  # can never break sudo.
+  log "Installing sudoers rule for instant sync..."
+  TMPS=$(mktemp)
+  cat > "$TMPS" <<EOF
+Defaults!/usr/local/sbin/kiosk-trigger env_keep += "SSH_ORIGINAL_COMMAND"
+$KIOSK_USER ALL=(root) NOPASSWD: /usr/local/sbin/kiosk-trigger
+EOF
+  visudo -cf "$TMPS" >/dev/null || die "Generated sudoers rule failed validation"
+  install -m 440 -o root -g root "$TMPS" /etc/sudoers.d/kiosk-trigger
+  rm -f "$TMPS"
+
+  # Upgrade hygiene: earlier agent versions put the manager key in root's
+  # authorized_keys; it now lives with the kiosk user. Remove the old block
+  # and force the agent to re-apply the key on its next poll.
+  if [[ -f /root/.ssh/authorized_keys ]] && grep -q "kiosk-manager-key" /root/.ssh/authorized_keys; then
+    sed -i '/# >>> kiosk-manager-key/,/# <<< kiosk-manager-key/d' /root/.ssh/authorized_keys
+  fi
+  rm -f /etc/kiosk/applied-managerkey-version
+
   # Placeholder display until the first config arrives (don't clobber on re-run)
   if [[ ! -f /etc/kiosk/cams.sh ]]; then
     TMPC=$(mktemp)

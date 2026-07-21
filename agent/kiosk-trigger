@@ -2,8 +2,10 @@
 #===============================================================================
 # kiosk-trigger - forced command for the display manager's SSH key.
 #
-# Installed by kiosk-agent into /root/.ssh/authorized_keys as:
-#   restrict,command="/usr/local/sbin/kiosk-trigger" ssh-rsa AAAA... display-manager
+# Installed by kiosk-agent into the kiosk user's authorized_keys as:
+#   restrict,command="sudo /usr/local/sbin/kiosk-trigger" ssh-rsa AAAA... display-manager
+# with /etc/sudoers.d/kiosk-trigger (written by kiosk-setup.sh) allowing the
+# kiosk user to run exactly this script as root, nothing else.
 #
 # Whatever the manager asks for arrives in SSH_ORIGINAL_COMMAND; only "sync"
 # is supported - it wakes the agent (SIGUSR1) so it polls and applies pending
