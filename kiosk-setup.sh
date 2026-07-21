@@ -3,27 +3,40 @@
 # Dahua NVR Camera Kiosk - One-line installer
 #
 # Sets up an Ubuntu Server machine (tested: Intel NUC5i5RYH, Ubuntu 24.04) to
-# boot straight into fullscreen mpv display of RTSP streams from a Dahua NVR.
+# boot straight into a fullscreen mpv display of RTSP streams from a Dahua NVR.
 #
-# Usage (interactive):
-#   curl -fsSL https://YOUR_HOST/kiosk-setup.sh | sudo bash
-#   or:  sudo bash kiosk-setup.sh
+# Two modes:
 #
-# Usage (non-interactive, e.g. for scripted rollout):
-#   sudo NVR_IP=192.168.1.108 NVR_USER=viewer NVR_PASS='secret' \
-#        LAYOUT=2h CHANNELS="1 2" KIOSK_USER=viewer bash kiosk-setup.sh
+#   MANAGED (recommended) - the screen registers with a central display
+#   manager and takes all configuration (layout, NVR details, SSH keys) from
+#   it. Remote restart/reboot from the manager UI. Only needs two inputs:
+#     curl -fsSL https://YOUR_HOST/kiosk-setup.sh | \
+#       sudo MANAGER_URL=http://10.0.40.5:5000 ENROLL_TOKEN=xxxx bash
+#
+#   STANDALONE - classic self-contained install, all settings prompted here:
+#     sudo STANDALONE=1 NVR_IP=192.168.1.108 NVR_USER=viewer NVR_PASS='secret' \
+#          LAYOUT=2h CHANNELS="1 2" bash kiosk-setup.sh
 #
 # Env vars / prompts:
-#   KIOSK_USER  - local user that autologins and runs the display (default: viewer)
+#   KIOSK_USER  - local user that runs the display (default: viewer)
+#   MANAGER_URL - display manager base URL -> managed mode
+#   ENROLL_TOKEN- enrollment token from the manager's Settings page
+#   STANDALONE  - set to 1 to force standalone mode
+#   SCRIPT_BASE_URL - where to fetch agent/* support files (default: this
+#                 repo's raw GitHub URL; a local checkout is used if present)
+#
+# Standalone-only env vars / prompts:
 #   NVR_IP      - IP address of the Dahua NVR
 #   NVR_PORT    - RTSP port (default: 554)
 #   NVR_USER    - NVR username with live-view rights
 #   NVR_PASS    - NVR password (special characters are auto URL-encoded)
-#   LAYOUT      - 1 | 2h | 2v | 4  (single / 2 side-by-side / 2 stacked / 2x2 grid)
+#   LAYOUT      - 1 | 2h | 2v | 4  (single / 2 side-by-side / 2 stacked / 2x2)
 #   CHANNELS    - space-separated NVR channel numbers, e.g. "1 2 3 4"
 #   SUBTYPE     - 0 main stream, 1 substream (default: 1; forced 1 for grids)
 #   ROTATE      - none | left | right  (monitor rotation, default: none)
-#   ROTATE_OUT  - X output name for rotation, e.g. HDMI-1 (auto-detected if blank)
+#   ROTATE_OUT  - X output name for rotation, e.g. HDMI-1 (auto-detected)
+#   SSH_KEYS_URL- URL of a public-key list refreshed hourly
+#                 (default: this repo's ssh-keys.txt)
 #===============================================================================
 set -euo pipefail
 
@@ -51,69 +64,97 @@ ask() { # ask VAR "Prompt" "default"
   fi
 }
 
-#--- Gather configuration ------------------------------------------------------
+SCRIPT_BASE_URL=${SCRIPT_BASE_URL:-https://raw.githubusercontent.com/mhenson-ejt/ubuntu-displayscreen/main}
+SCRIPT_BASE_URL=${SCRIPT_BASE_URL%/}
+SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")
+
+fetch_file() { # fetch_file <repo-relative-path> <dest> <mode>
+  local rel=$1 dest=$2 mode=$3
+  if [[ -n $SCRIPT_DIR && -f $SCRIPT_DIR/$rel ]]; then
+    install -m "$mode" "$SCRIPT_DIR/$rel" "$dest"
+  else
+    local tmp; tmp=$(mktemp)
+    curl -fsSL "$SCRIPT_BASE_URL/$rel" -o "$tmp" || die "Failed to download $SCRIPT_BASE_URL/$rel"
+    install -m "$mode" "$tmp" "$dest"
+    rm -f "$tmp"
+  fi
+}
+
+#--- Mode selection ------------------------------------------------------------
+STANDALONE=${STANDALONE:-}
+MANAGER_URL=${MANAGER_URL:-}
+if [[ -z $STANDALONE && -z $MANAGER_URL ]]; then
+  echo "Install modes:"
+  echo "  managed    - central display manager drives this screen (recommended)"
+  echo "  standalone - all settings configured here, on this box"
+  read -rp "Manager URL (e.g. http://10.0.40.5:5000; leave blank for standalone): " MANAGER_URL < "$TTY"
+fi
+if [[ -n $STANDALONE || -z $MANAGER_URL ]]; then MODE=standalone; else MODE=managed; fi
+log "Install mode: $MODE"
+
+#--- Gather common configuration -----------------------------------------------
 KIOSK_USER=${KIOSK_USER:-}
-ask KIOSK_USER "Kiosk user (will autologin on tty1)" "viewer"
+ask KIOSK_USER "Kiosk user (runs the display)" "viewer"
 id "$KIOSK_USER" &>/dev/null || die "User '$KIOSK_USER' does not exist. Create it first: sudo adduser $KIOSK_USER"
 KIOSK_HOME=$(getent passwd "$KIOSK_USER" | cut -d: -f6)
 
-NVR_IP=${NVR_IP:-};     ask NVR_IP   "Dahua NVR IP address"
-NVR_PORT=${NVR_PORT:-}; ask NVR_PORT "NVR RTSP port" "554"
-NVR_USER=${NVR_USER:-}; ask NVR_USER "NVR username (live-view rights)" "viewer"
-if [[ -z "${NVR_PASS:-}" ]]; then
-  read -rsp "NVR password: " NVR_PASS < "$TTY"; echo
-  [[ -n $NVR_PASS ]] || die "Password cannot be empty."
+if [[ $MODE == managed ]]; then
+  MANAGER_URL=${MANAGER_URL%/}
+  ENROLL_TOKEN=${ENROLL_TOKEN:-}
+  ask ENROLL_TOKEN "Enrollment token (manager Settings page)"
 fi
 
-LAYOUT=${LAYOUT:-}
-if [[ -z $LAYOUT ]]; then
-  echo "Layouts:  1 = single camera fullscreen"
-  echo "          2h = 2 cameras side-by-side (landscape monitor)"
-  echo "          2v = 2 cameras stacked (portrait monitor)"
-  echo "          4  = 2x2 grid"
-  ask LAYOUT "Layout" "4"
+if [[ $MODE == standalone ]]; then
+  NVR_IP=${NVR_IP:-};     ask NVR_IP   "Dahua NVR IP address"
+  NVR_PORT=${NVR_PORT:-}; ask NVR_PORT "NVR RTSP port" "554"
+  [[ $NVR_PORT =~ ^[0-9]+$ ]] || die "NVR_PORT must be numeric"
+  NVR_USER=${NVR_USER:-}; ask NVR_USER "NVR username (live-view rights)" "viewer"
+  if [[ -z "${NVR_PASS:-}" ]]; then
+    read -rsp "NVR password: " NVR_PASS < "$TTY"; echo
+    [[ -n $NVR_PASS ]] || die "Password cannot be empty."
+  fi
+
+  LAYOUT=${LAYOUT:-}
+  if [[ -z $LAYOUT ]]; then
+    echo "Layouts:  1 = single camera fullscreen"
+    echo "          2h = 2 cameras side-by-side (landscape monitor)"
+    echo "          2v = 2 cameras stacked (portrait monitor)"
+    echo "          4  = 2x2 grid"
+    ask LAYOUT "Layout" "4"
+  fi
+  case $LAYOUT in 1|2h|2v|4) ;; *) die "LAYOUT must be one of: 1 2h 2v 4" ;; esac
+
+  case $LAYOUT in
+    1) NEED=1 ;;
+    2h|2v) NEED=2 ;;
+    4) NEED=4 ;;
+  esac
+  CHANNELS=${CHANNELS:-}
+  ask CHANNELS "NVR channel numbers, space-separated ($NEED needed)" "$(seq -s' ' 1 $NEED)"
+  read -ra CH <<< "$CHANNELS"
+  [[ ${#CH[@]} -eq $NEED ]] || die "Layout '$LAYOUT' needs exactly $NEED channels, got ${#CH[@]}."
+  for c in "${CH[@]}"; do [[ $c =~ ^[0-9]+$ ]] || die "Channel '$c' is not a number."; done
+
+  SUBTYPE=${SUBTYPE:-1}
+  if [[ $LAYOUT != 1 && $SUBTYPE != 1 ]]; then
+    warn "Grid layouts should use substreams; forcing SUBTYPE=1."
+    SUBTYPE=1
+  fi
+
+  ROTATE=${ROTATE:-}
+  if [[ $LAYOUT == 2v ]]; then ask ROTATE "Rotate monitor (left/right/none)" "right"
+  else ask ROTATE "Rotate monitor (left/right/none)" "none"; fi
+  case $ROTATE in none|left|right) ;; *) die "ROTATE must be none, left or right" ;; esac
+  ROTATE_OUT=${ROTATE_OUT:-}
 fi
-case $LAYOUT in 1|2h|2v|4) ;; *) die "LAYOUT must be one of: 1 2h 2v 4" ;; esac
-
-case $LAYOUT in
-  1) NEED=1 ;;
-  2h|2v) NEED=2 ;;
-  4) NEED=4 ;;
-esac
-CHANNELS=${CHANNELS:-}
-ask CHANNELS "NVR channel numbers, space-separated ($NEED needed)" "$(seq -s' ' 1 $NEED)"
-read -ra CH <<< "$CHANNELS"
-[[ ${#CH[@]} -eq $NEED ]] || die "Layout '$LAYOUT' needs exactly $NEED channels, got ${#CH[@]}."
-
-SUBTYPE=${SUBTYPE:-1}
-if [[ $LAYOUT != 1 && $SUBTYPE != 1 ]]; then
-  warn "Grid layouts should use substreams; forcing SUBTYPE=1."
-  SUBTYPE=1
-fi
-
-ROTATE=${ROTATE:-}
-if [[ $LAYOUT == 2v ]]; then ask ROTATE "Rotate monitor (left/right/none)" "right"
-else ask ROTATE "Rotate monitor (left/right/none)" "none"; fi
-case $ROTATE in none|left|right) ;; *) die "ROTATE must be none, left or right" ;; esac
-ROTATE_OUT=${ROTATE_OUT:-}
-
-#--- URL-encode the password ---------------------------------------------------
-urlencode() {
-  local s=$1 out="" c
-  for (( i=0; i<${#s}; i++ )); do
-    c=${s:$i:1}
-    case $c in [a-zA-Z0-9.~_-]) out+=$c ;; *) printf -v hex '%%%02X' "'$c"; out+=$hex ;; esac
-  done
-  echo "$out"
-}
-NVR_PASS_ENC=$(urlencode "$NVR_PASS")
 
 #--- Install packages ----------------------------------------------------------
 log "Installing packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-  xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo
+  xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo \
+  openssh-server curl ca-certificates jq
 
 #--- Groups & X wrapper --------------------------------------------------------
 log "Configuring user groups and X permissions..."
@@ -124,95 +165,175 @@ allowed_users=anybody
 needs_root_rights=yes
 EOF
 
-#--- Autologin on tty1 ---------------------------------------------------------
-log "Configuring autologin for '$KIOSK_USER' on tty1..."
-mkdir -p /etc/systemd/system/getty@tty1.service.d
-cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<EOF
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin $KIOSK_USER --noclear %I \$TERM
-EOF
-systemctl daemon-reload
-
-#--- Generate cams.sh ----------------------------------------------------------
-log "Writing $KIOSK_HOME/cams.sh ..."
-
-ROTATE_LINE="# no rotation"
-if [[ $ROTATE != none ]]; then
-  if [[ -n $ROTATE_OUT ]]; then
-    ROTATE_LINE="xrandr --output $ROTATE_OUT --rotate $ROTATE"
-  else
-    # Auto-detect the first connected output at runtime
-    ROTATE_LINE='OUT=$(xrandr | awk '"'"'/ connected/{print $1; exit}'"'"'); xrandr --output "$OUT" --rotate '"$ROTATE"
-  fi
+#--- Remove legacy autologin setup (pre-manager installs) ----------------------
+if [[ -f /etc/systemd/system/getty@tty1.service.d/autologin.conf ]]; then
+  log "Removing legacy tty1 autologin (replaced by kiosk-display.service)..."
+  rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
+  rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d
+fi
+PROFILE="$KIOSK_HOME/.bash_profile"
+if [[ -f $PROFILE ]] && grep -q "# kiosk-autostart" "$PROFILE"; then
+  log "Removing legacy startx hook from .bash_profile..."
+  sed -i '/# kiosk-autostart/,/^fi$/d' "$PROFILE"
 fi
 
-URLBASE="rtsp://${NVR_USER}:${NVR_PASS_ENC}@${NVR_IP}:${NVR_PORT}/cam/realmonitor"
+#--- /etc/kiosk base -----------------------------------------------------------
+mkdir -p /etc/kiosk
+cat > /etc/kiosk/kiosk.conf <<EOF
+KIOSK_USER=$KIOSK_USER
+KIOSK_HOME=$KIOSK_HOME
+EOF
 
-MPV_COMMON='--fs --no-osc --no-input-default-bindings --no-keepaspect --really-quiet \
-      --hwdec=auto --profile=low-latency --rtsp-transport=tcp'
+log "Installing display renderer and display service..."
+fetch_file agent/kiosk-render-cams /usr/local/sbin/kiosk-render-cams 755
+fetch_file agent/kiosk-display.service /etc/systemd/system/kiosk-display.service 644
+sed -i "s/@KIOSK_USER@/$KIOSK_USER/" /etc/systemd/system/kiosk-display.service
 
-case $LAYOUT in
-  1)
-    MPV_CMD="mpv $MPV_COMMON \\
-      \"\${URL}?channel=${CH[0]}&subtype=${SUBTYPE}\""
-    ;;
-  2h)
-    MPV_CMD="mpv $MPV_COMMON \\
-      --lavfi-complex=\"[vid1][vid2]hstack[vo]\" \\
-      --external-file=\"\${URL}?channel=${CH[1]}&subtype=${SUBTYPE}\" \\
-      \"\${URL}?channel=${CH[0]}&subtype=${SUBTYPE}\""
-    ;;
-  2v)
-    MPV_CMD="mpv $MPV_COMMON \\
-      --lavfi-complex=\"[vid1][vid2]vstack[vo]\" \\
-      --external-file=\"\${URL}?channel=${CH[1]}&subtype=${SUBTYPE}\" \\
-      \"\${URL}?channel=${CH[0]}&subtype=${SUBTYPE}\""
-    ;;
-  4)
-    MPV_CMD="mpv $MPV_COMMON \\
-      --lavfi-complex=\"[vid1][vid2]hstack[top];[vid3][vid4]hstack[bottom];[top][bottom]vstack[vo]\" \\
-      --external-file=\"\${URL}?channel=${CH[1]}&subtype=${SUBTYPE}\" \\
-      --external-file=\"\${URL}?channel=${CH[2]}&subtype=${SUBTYPE}\" \\
-      --external-file=\"\${URL}?channel=${CH[3]}&subtype=${SUBTYPE}\" \\
-      \"\${URL}?channel=${CH[0]}&subtype=${SUBTYPE}\""
-    ;;
-esac
+#--- SSH key updater (both modes) ----------------------------------------------
+# Managed mode: the agent calls it with a key file fetched from the manager.
+# Standalone mode: an hourly timer calls it with no args -> fetches from URL.
+SSH_KEYS_URL=${SSH_KEYS_URL:-$SCRIPT_BASE_URL/ssh-keys.txt}
+[[ $MODE == managed ]] && UPDATER_URL="" || UPDATER_URL=$SSH_KEYS_URL
 
-cat > "$KIOSK_HOME/cams.sh" <<EOF
+log "Installing SSH key updater..."
+cat > /usr/local/sbin/kiosk-update-ssh-keys <<EOF
 #!/bin/bash
-# Generated by kiosk-setup.sh on $(date -Iseconds)
-export LIBVA_DRIVER_NAME=i965
+# Generated by kiosk-setup.sh - rewrites the managed block in the kiosk
+# user's authorized_keys. Keys outside the markers are left alone.
+# Usage: kiosk-update-ssh-keys [keyfile]   (no arg: fetch from \$URL)
+# If the source yields no valid keys, authorized_keys is left unchanged.
+set -euo pipefail
+URL="$UPDATER_URL"
+KEY_USER="$KIOSK_USER"
+AK_DIR="$KIOSK_HOME/.ssh"
+EOF
+cat >> /usr/local/sbin/kiosk-update-ssh-keys <<'EOF'
+AK="$AK_DIR/authorized_keys"
+BEGIN="# >>> kiosk-managed-keys (do not edit between markers) >>>"
+END="# <<< kiosk-managed-keys <<<"
 
+TMP=$(mktemp)
+trap 'rm -f "$TMP" "$TMP.keys" "$TMP.new"' EXIT
+
+if [[ -n ${1:-} ]]; then
+  cp "$1" "$TMP"
+elif [[ -n $URL ]]; then
+  curl -fsSL --max-time 30 "$URL" -o "$TMP"
+else
+  echo "kiosk-update-ssh-keys: no key file argument and no URL configured" >&2
+  exit 1
+fi
+
+grep -E '^(ssh|ecdsa|sk)-[A-Za-z0-9@.-]+ [A-Za-z0-9+/=]+' "$TMP" > "$TMP.keys" || true
+if [[ ! -s "$TMP.keys" ]]; then
+  echo "kiosk-update-ssh-keys: no valid keys in source - authorized_keys left unchanged" >&2
+  exit 1
+fi
+
+install -d -m 700 -o "$KEY_USER" -g "$KEY_USER" "$AK_DIR"
+touch "$AK"
+awk -v b="$BEGIN" -v e="$END" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$AK" > "$TMP.new"
+{ echo "$BEGIN"; cat "$TMP.keys"; echo "$END"; } >> "$TMP.new"
+install -m 600 -o "$KEY_USER" -g "$KEY_USER" "$TMP.new" "$AK"
+echo "kiosk-update-ssh-keys: installed $(wc -l < "$TMP.keys") key(s) for $KEY_USER"
+EOF
+chmod 755 /usr/local/sbin/kiosk-update-ssh-keys
+
+#===============================================================================
+if [[ $MODE == managed ]]; then
+  #--- Managed mode ------------------------------------------------------------
+  log "Configuring managed mode (manager: $MANAGER_URL)..."
+
+  cat > /etc/kiosk/agent.env <<EOF
+MANAGER_URL=$MANAGER_URL
+ENROLL_TOKEN=$ENROLL_TOKEN
+EOF
+  chmod 600 /etc/kiosk/agent.env
+
+  fetch_file agent/kiosk-agent /usr/local/sbin/kiosk-agent 755
+  fetch_file agent/kiosk-agent.service /etc/systemd/system/kiosk-agent.service 644
+
+  # Placeholder display until the first config arrives (don't clobber on re-run)
+  if [[ ! -f /etc/kiosk/cams.sh ]]; then
+    TMPC=$(mktemp)
+    cat > "$TMPC" <<'EOF'
+#!/bin/bash
+# Placeholder - replaced automatically when configuration arrives from the manager
 xset s off
 xset -dpms
 xset s noblank
-
-$ROTATE_LINE
-
-URL="$URLBASE"
-
-while true; do
-  $MPV_CMD
-  sleep 3
-done
+while true; do sleep 60; done
 EOF
-chmod 755 "$KIOSK_HOME/cams.sh"
-chown "$KIOSK_USER:" "$KIOSK_HOME/cams.sh"
+    install -m 750 -o root -g "$KIOSK_USER" "$TMPC" /etc/kiosk/cams.sh
+    rm -f "$TMPC"
+  fi
 
-#--- .bash_profile hook --------------------------------------------------------
-log "Adding startx hook to $KIOSK_HOME/.bash_profile ..."
-PROFILE="$KIOSK_HOME/.bash_profile"
-MARK="# kiosk-autostart"
-touch "$PROFILE"; chown "$KIOSK_USER:" "$PROFILE"
-if ! grep -q "$MARK" "$PROFILE"; then
-  cat >> "$PROFILE" <<EOF
+  # The manager supersedes the GitHub-hosted key list timer
+  systemctl disable --now kiosk-ssh-keys.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/kiosk-ssh-keys.service /etc/systemd/system/kiosk-ssh-keys.timer
 
-$MARK
-if [[ -z \$DISPLAY && \$(tty) == /dev/tty1 ]]; then
-  exec startx $KIOSK_HOME/cams.sh -- -nocursor
-fi
+  systemctl daemon-reload
+  systemctl disable getty@tty1.service 2>/dev/null || true
+  systemctl enable --now kiosk-agent kiosk-display
+
+  log "Waiting for registration with the manager (up to 60s)..."
+  REGISTERED=""
+  for _ in $(seq 1 30); do
+    if grep -q '^API_TOKEN=' /etc/kiosk/agent.env 2>/dev/null; then REGISTERED=1; break; fi
+    sleep 2
+  done
+  if [[ -n $REGISTERED ]]; then
+    log "Registered with the manager as '$(hostname)'."
+  else
+    warn "Not registered yet - check: journalctl -u kiosk-agent -f  (wrong enroll token? manager unreachable?)"
+  fi
+else
+  #--- Standalone mode ---------------------------------------------------------
+  log "Writing /etc/kiosk/config.json ..."
+  CHANNELS_JSON=$(printf '%s\n' "${CH[@]}" | jq -R 'tonumber' | jq -cs .)
+  jq -n --arg ip "$NVR_IP" --argjson port "$NVR_PORT" --arg user "$NVR_USER" \
+        --arg pass "$NVR_PASS" --arg layout "$LAYOUT" --argjson channels "$CHANNELS_JSON" \
+        --argjson subtype "$SUBTYPE" --arg rotate "$ROTATE" --arg rout "${ROTATE_OUT:-}" \
+        '{version: 0, nvrIp: $ip, nvrPort: $port, nvrUser: $user, nvrPass: $pass,
+          layout: $layout, channels: $channels, subtype: $subtype, rotate: $rotate,
+          rotateOutput: (if $rout == "" then null else $rout end)}' \
+        > /etc/kiosk/config.json
+  chmod 600 /etc/kiosk/config.json
+
+  /usr/local/sbin/kiosk-render-cams
+
+  # Hourly SSH key refresh from the repo's ssh-keys.txt
+  log "Installing SSH key refresh timer (source: $SSH_KEYS_URL)..."
+  cat > /etc/systemd/system/kiosk-ssh-keys.service <<'EOF'
+[Unit]
+Description=Refresh kiosk SSH authorized keys from the shared key list
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kiosk-update-ssh-keys
 EOF
+
+  cat > /etc/systemd/system/kiosk-ssh-keys.timer <<'EOF'
+[Unit]
+Description=Hourly refresh of kiosk SSH authorized keys
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl disable getty@tty1.service 2>/dev/null || true
+  systemctl enable --now kiosk-ssh-keys.timer kiosk-display
+
+  /usr/local/sbin/kiosk-update-ssh-keys \
+    || warn "Initial SSH key import failed - check $SSH_KEYS_URL (timer retries hourly)."
 fi
 
 #--- Verify VAAPI (informational only) -----------------------------------------
@@ -225,14 +346,22 @@ fi
 #--- Done ----------------------------------------------------------------------
 log "Setup complete."
 echo
-echo "  Layout   : $LAYOUT   Channels: ${CH[*]}   Subtype: $SUBTYPE"
-echo "  NVR      : $NVR_IP:$NVR_PORT (user: $NVR_USER)"
-echo "  Rotation : $ROTATE"
-echo "  Script   : $KIOSK_HOME/cams.sh"
+if [[ $MODE == managed ]]; then
+  echo "  Mode     : managed by $MANAGER_URL"
+  echo "  Configure layout/NVR/SSH keys for this screen in the manager UI."
+  echo "  Display  : systemctl status kiosk-display   Agent: journalctl -u kiosk-agent -f"
+else
+  echo "  Mode     : standalone"
+  echo "  Layout   : $LAYOUT   Channels: ${CH[*]}   Subtype: $SUBTYPE"
+  echo "  NVR      : $NVR_IP:$NVR_PORT (user: $NVR_USER)"
+  echo "  Rotation : $ROTATE"
+  echo "  SSH keys : $SSH_KEYS_URL (refreshed hourly)"
+  echo "  Config   : /etc/kiosk/config.json (edit + run kiosk-render-cams && systemctl restart kiosk-display)"
+fi
 echo
 echo "Reminders:"
 echo "  - BIOS: set 'After Power Failure' = Power On (F2 at boot)"
 echo "  - NVR : substreams set to H.264, identical resolutions across channels"
 echo
-read -rp "Reboot now to start the kiosk? [y/N]: " R < "$TTY" || R=n
+read -rp "Reboot now (recommended for a clean first start)? [y/N]: " R < "$TTY" || R=n
 [[ ${R,,} == y ]] && reboot || log "Run 'sudo reboot' when ready."
