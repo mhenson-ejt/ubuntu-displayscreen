@@ -95,8 +95,15 @@ run_once() {
 
   apply_rotation "$rotate" "$rout"
 
+  # discardcorrupt: drop truncated frames instead of rendering them - a bad
+  # frame is a brief freeze on that tile, not a white smear that persists
+  # until the next keyframe. A small demuxer cache (instead of the previous
+  # low-latency profile) absorbs network/CPU hiccups; ~1s extra latency is
+  # invisible on a wall display.
   local common=(--fs --no-osc --no-input-default-bindings --no-keepaspect --really-quiet
-                --hwdec=auto --profile=low-latency --rtsp-transport=tcp)
+                --hwdec=auto --rtsp-transport=tcp
+                --demuxer-lavf-o-add=fflags=+discardcorrupt
+                --cache=yes --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
   local args=("${common[@]}")
 
   if (( n == 1 )); then
