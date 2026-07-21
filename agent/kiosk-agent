@@ -1,0 +1,249 @@
+#!/bin/bash
+#===============================================================================
+# kiosk-agent - keeps this screen in sync with the display manager
+#
+# Runs as root under systemd (kiosk-agent.service). Every 15 seconds:
+#   1. Registers with the manager if we have no API token yet (or ours was
+#      rejected) using the enroll token from /etc/kiosk/agent.env.
+#   2. Polls the manager with our status; learns desired config/ssh-key
+#      versions and any queued commands.
+#   3. On config version drift: fetches config, renders cams.sh, restarts
+#      the display. On key version drift: fetches keys and applies them via
+#      kiosk-update-ssh-keys (which refuses empty lists - lockout safety).
+#   4. Installs the manager's SSH public key into /root/.ssh/authorized_keys
+#      behind a forced command (kiosk-trigger), so the manager can wake this
+#      agent instantly (SIGUSR1) instead of waiting for the next poll.
+#   5. Executes queued commands (restart-display, reboot) and acks them.
+#
+# The manager being unreachable never affects the running display.
+#===============================================================================
+set -uo pipefail
+
+AGENT_VERSION="1.1"
+ENV_FILE=/etc/kiosk/agent.env
+CONF_DIR=/etc/kiosk
+POLL_INTERVAL=15
+
+log() { echo "$*"; }
+
+# http METHOD PATH BODYFILE_OUT [DATA] -> echoes HTTP status; body in BODYFILE_OUT
+http() {
+  local method=$1 path=$2 out=$3 data=${4:-}
+  local args=(-sS --connect-timeout 5 --max-time 15 -o "$out" -w '%{http_code}' -X "$method" "$MANAGER_URL$path")
+  [[ -n ${API_TOKEN:-} ]] && args+=(-H "Authorization: Bearer $API_TOKEN")
+  [[ -n $data ]] && args+=(-H "Content-Type: application/json" -d "$data")
+  curl "${args[@]}" 2>/dev/null
+}
+
+register() {
+  [[ -n ${ENROLL_TOKEN:-} ]] || { log "register: no ENROLL_TOKEN in $ENV_FILE"; return 1; }
+  local body out code token id
+  body=$(jq -n --arg t "$ENROLL_TOKEN" --arg h "$(hostname)" \
+              --arg m "$(cat /etc/machine-id)" --arg v "$AGENT_VERSION" \
+              '{enrollToken:$t, hostname:$h, machineId:$m, agentVersion:$v}')
+  out=$(mktemp)
+  code=$(http POST /api/agent/register "$out" "$body") || { rm -f "$out"; log "register: manager unreachable"; return 1; }
+  if [[ $code != 200 ]]; then
+    log "register: HTTP $code (wrong enroll token?)"
+    rm -f "$out"; return 1
+  fi
+  token=$(jq -r '.apiToken // empty' "$out")
+  id=$(jq -r '.screenId // empty' "$out")
+  rm -f "$out"
+  [[ -n $token && -n $id ]] || { log "register: malformed response"; return 1; }
+  sed -i '/^API_TOKEN=/d;/^SCREEN_ID=/d' "$ENV_FILE"
+  printf 'API_TOKEN=%s\nSCREEN_ID=%s\n' "$token" "$id" >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  log "register: enrolled as $(hostname) (screen $id)"
+}
+
+applied_version() { # applied_version FILE -> sanitized integer
+  local v
+  v=$(cat "$CONF_DIR/$1" 2>/dev/null || echo 0)
+  [[ $v =~ ^[0-9]+$ ]] && echo "$v" || echo 0
+}
+
+build_status() {
+  local active=false ip up
+  systemctl is-active --quiet kiosk-display && active=true
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  up=$(awk '{print int($1)}' /proc/uptime)
+  jq -n --argjson ac "$(applied_version applied-config-version)" \
+        --argjson ak "$(applied_version applied-sshkeys-version)" \
+        --arg v "$AGENT_VERSION" --argjson da "$active" \
+        --arg ip "${ip:-}" --argjson up "${up:-0}" \
+        '{appliedConfigVersion:$ac, appliedSshKeysVersion:$ak, agentVersion:$v,
+          displayActive:$da, localIp:$ip, uptimeSeconds:$up}'
+}
+
+apply_config() {
+  local want=$1
+  [[ $want =~ ^[0-9]+$ ]] && (( want > 0 )) || return 0
+  [[ $want -ne $(applied_version applied-config-version) ]] || return 0
+
+  local out code ver
+  out=$(mktemp)
+  code=$(http GET /api/agent/config "$out") || { rm -f "$out"; return 0; }
+  [[ $code == 200 ]] || { log "config: HTTP $code"; rm -f "$out"; return 0; }
+  if ! jq -e '(.nvrIp | length > 0) and (.layout | length > 0) and (.channels | length > 0)' "$out" >/dev/null 2>&1; then
+    log "config: payload failed validation - ignoring"
+    rm -f "$out"; return 0
+  fi
+  ver=$(jq -r '.version' "$out")
+  install -m 600 -o root -g root "$out" "$CONF_DIR/config.json"
+  rm -f "$out"
+  if kiosk-render-cams; then
+    systemctl restart kiosk-display
+    echo "$ver" > "$CONF_DIR/applied-config-version"
+    log "config: applied v$ver and restarted display"
+  else
+    log "config: render failed - previous display config kept, version not recorded"
+  fi
+}
+
+apply_keys() {
+  local want=$1
+  [[ $want =~ ^[0-9]+$ ]] || return 0
+  [[ $want -ne $(applied_version applied-sshkeys-version) ]] || return 0
+  # This version was already refused (empty list) - wait for the list to change
+  [[ $want -ne $(applied_version refused-sshkeys-version) ]] || return 0
+
+  local out keysfile code ver
+  out=$(mktemp); keysfile=$(mktemp)
+  code=$(http GET /api/agent/ssh-keys "$out") || { rm -f "$out" "$keysfile"; return 0; }
+  if [[ $code != 200 ]]; then log "ssh-keys: HTTP $code"; rm -f "$out" "$keysfile"; return 0; fi
+  ver=$(jq -r '.version // empty' "$out")
+  jq -r '.keys[]?' "$out" > "$keysfile"
+  if kiosk-update-ssh-keys "$keysfile"; then
+    echo "$ver" > "$CONF_DIR/applied-sshkeys-version"
+    rm -f "$CONF_DIR/refused-sshkeys-version"
+    log "ssh-keys: applied v$ver"
+  else
+    echo "$want" > "$CONF_DIR/refused-sshkeys-version"
+    log "ssh-keys: updater refused the list (empty?) - keys unchanged, retrying when the list changes"
+  fi
+  rm -f "$out" "$keysfile"
+}
+
+apply_manager_key() {
+  local want=$1
+  [[ $want =~ ^[0-9]+$ ]] && (( want > 0 )) || return 0
+  [[ $want -ne $(applied_version applied-managerkey-version) ]] || return 0
+
+  local out code key ver
+  out=$(mktemp)
+  code=$(http GET /api/agent/manager-key "$out") || { rm -f "$out"; return 0; }
+  [[ $code == 200 ]] || { log "manager-key: HTTP $code"; rm -f "$out"; return 0; }
+  key=$(jq -r '.publicKey // empty' "$out")
+  ver=$(jq -r '.version // 0' "$out")
+  rm -f "$out"
+  [[ -n $key ]] || { log "manager-key: empty response"; return 0; }
+
+  local ak=/root/.ssh/authorized_keys tmp
+  local begin="# >>> kiosk-manager-key (do not edit between markers) >>>"
+  local end="# <<< kiosk-manager-key <<<"
+  install -d -m 700 /root/.ssh
+  touch "$ak"
+  tmp=$(mktemp)
+  awk -v b="$begin" -v e="$end" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$ak" > "$tmp"
+  {
+    echo "$begin"
+    # restrict + forced command: this key can only trigger an immediate sync
+    echo "restrict,command=\"/usr/local/sbin/kiosk-trigger\" $key"
+    echo "$end"
+  } >> "$tmp"
+  install -m 600 -o root -g root "$tmp" "$ak"
+  rm -f "$tmp"
+  echo "$ver" > "$CONF_DIR/applied-managerkey-version"
+  log "manager-key: installed v$ver (instant sync enabled)"
+}
+
+ack() { # ack COMMAND_ID RESULT MESSAGE
+  local body out
+  body=$(jq -n --arg r "$2" --arg m "$3" '{result:$r, message:$m}')
+  out=$(mktemp)
+  http POST "/api/agent/commands/$1/ack" "$out" "$body" >/dev/null || true
+  rm -f "$out"
+}
+
+handle_command() {
+  local id type
+  id=$(jq -r '.id' <<<"$1")
+  type=$(jq -r '.type' <<<"$1")
+  log "command: $type ($id)"
+  case $type in
+    restart-display)
+      if systemctl restart kiosk-display; then ack "$id" ok ""
+      else ack "$id" error "systemctl restart kiosk-display failed"; fi
+      ;;
+    reboot)
+      # Ack first, then reboot detached so the ack and this loop aren't killed mid-flight
+      ack "$id" ok "rebooting"
+      systemd-run --on-active=5 systemctl reboot >/dev/null 2>&1 || systemctl reboot
+      ;;
+    *)
+      ack "$id" error "unknown command type: $type"
+      ;;
+  esac
+}
+
+tick() {
+  unset API_TOKEN SCREEN_ID
+  source "$ENV_FILE" 2>/dev/null || { log "missing $ENV_FILE"; return; }
+  [[ -n ${MANAGER_URL:-} ]] || { log "no MANAGER_URL in $ENV_FILE"; return; }
+  MANAGER_URL=${MANAGER_URL%/}
+
+  if [[ -z ${API_TOKEN:-} ]]; then
+    register || return
+    source "$ENV_FILE"
+  fi
+
+  local out code resp
+  out=$(mktemp)
+  code=$(http POST /api/agent/poll "$out" "$(build_status)") || { rm -f "$out"; log "poll: manager unreachable"; return; }
+  if [[ $code == 401 ]]; then
+    log "poll: token rejected - re-registering next tick"
+    sed -i '/^API_TOKEN=/d;/^SCREEN_ID=/d' "$ENV_FILE"
+    rm -f "$out"; return
+  fi
+  [[ $code == 200 ]] || { log "poll: HTTP $code"; rm -f "$out"; return; }
+  resp=$(cat "$out"); rm -f "$out"
+  jq -e . >/dev/null 2>&1 <<<"$resp" || { log "poll: invalid JSON response"; return; }
+
+  local cfg_ver keys_ver mkey_ver ncmds
+  cfg_ver=$(jq -r '.configVersion // 0' <<<"$resp")
+  keys_ver=$(jq -r '.sshKeysVersion // 0' <<<"$resp")
+  mkey_ver=$(jq -r '.managerKeyVersion // 0' <<<"$resp")
+  ncmds=$(jq -r '.commands | length' <<<"$resp")
+
+  apply_config "$cfg_ver"
+  apply_keys "$keys_ver"
+  apply_manager_key "$mkey_ver"
+
+  while IFS= read -r cmd; do
+    [[ -n $cmd ]] && handle_command "$cmd"
+  done < <(jq -c '.commands[]?' <<<"$resp")
+
+  log "poll: ok (config v$(applied_version applied-config-version)/$cfg_ver, keys v$(applied_version applied-sshkeys-version)/$keys_ver, commands $ncmds)"
+}
+
+# SIGUSR1 (sent by kiosk-trigger when the manager SSHes in) interrupts the
+# sleep so changes apply instantly instead of waiting out the poll interval.
+WOKEN=0
+trap 'WOKEN=1' USR1
+
+log "kiosk-agent $AGENT_VERSION starting (poll every ${POLL_INTERVAL}s; SIGUSR1 forces an immediate sync)"
+while true; do
+  TICK_START=$(date +%s)
+  tick || true
+  ELAPSED=$(( $(date +%s) - TICK_START ))
+  REMAIN=$(( POLL_INTERVAL - ELAPSED ))
+  (( REMAIN < 1 )) && REMAIN=1
+  WOKEN=0
+  sleep "$REMAIN" &
+  SLEEP_PID=$!
+  if ! wait "$SLEEP_PID" 2>/dev/null; then
+    kill "$SLEEP_PID" 2>/dev/null || true
+    (( WOKEN )) && log "sync: woken by manager"
+  fi
+done

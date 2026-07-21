@@ -1,0 +1,22 @@
+#!/bin/bash
+#===============================================================================
+# kiosk-trigger - forced command for the display manager's SSH key.
+#
+# Installed by kiosk-agent into /root/.ssh/authorized_keys as:
+#   restrict,command="/usr/local/sbin/kiosk-trigger" ssh-rsa AAAA... display-manager
+#
+# Whatever the manager asks for arrives in SSH_ORIGINAL_COMMAND; only "sync"
+# is supported - it wakes the agent (SIGUSR1) so it polls and applies pending
+# changes immediately instead of waiting out the poll interval. The manager's
+# key can do nothing else on this machine.
+#===============================================================================
+case "${SSH_ORIGINAL_COMMAND:-sync}" in
+  sync)
+    systemctl kill --signal=SIGUSR1 kiosk-agent 2>/dev/null || exit 1
+    echo "sync triggered"
+    ;;
+  *)
+    echo "kiosk-trigger: unsupported command '${SSH_ORIGINAL_COMMAND}'" >&2
+    exit 1
+    ;;
+esac
