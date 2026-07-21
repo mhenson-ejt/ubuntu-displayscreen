@@ -1,0 +1,122 @@
+#!/bin/bash
+#===============================================================================
+# kiosk-cams - the display loop, installed as /etc/kiosk/cams.sh.
+#
+# Runs inside the X session started by kiosk-display.service. Every iteration
+# it re-reads /etc/kiosk/config.json, applies rotation, rebuilds the mpv
+# command and runs it. A config change therefore only needs mpv killed (the
+# agent does `pkill mpv`) - the new settings are live in a few seconds with
+# no X restart and no black flash.
+#
+# Set KIOSK_DRYRUN=1 to print the xrandr/mpv commands instead of running them
+# (used by tests; no X or mpv needed).
+#===============================================================================
+CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
+
+say() { echo "kiosk-cams: $*" >&2; }
+
+if [[ -z ${KIOSK_DRYRUN:-} ]]; then
+  export LIBVA_DRIVER_NAME=i965
+  xset s off
+  xset -dpms
+  xset s noblank
+fi
+
+urlencode() {
+  local s=$1 out="" c hex
+  for (( i=0; i<${#s}; i++ )); do
+    c=${s:$i:1}
+    case $c in [a-zA-Z0-9.~_-]) out+=$c ;; *) printf -v hex '%%%02X' "'$c"; out+=$hex ;; esac
+  done
+  echo "$out"
+}
+
+apply_rotation() { # apply_rotation none|left|right OUTPUT-or-empty
+  local rotate=$1 out=$2 mode
+  case $rotate in left|right) mode=$rotate ;; *) mode=normal ;; esac
+  if [[ -z $out && -z ${KIOSK_DRYRUN:-} ]]; then
+    out=$(xrandr | awk '/ connected/{print $1; exit}')
+  fi
+  if [[ -n ${KIOSK_DRYRUN:-} ]]; then
+    echo "XRANDR --output ${out:-auto} --rotate $mode"
+  else
+    [[ -n $out ]] && xrandr --output "$out" --rotate "$mode" 2>/dev/null
+  fi
+}
+
+# Builds and runs one mpv session from the current config.
+# Returns 1 if the config is missing/unusable (caller waits and retries).
+run_once() {
+  [[ -r $CONFIG ]] || { say "waiting for $CONFIG"; return 1; }
+  jq -e . "$CONFIG" >/dev/null 2>&1 || { say "config is not valid JSON"; return 1; }
+
+  local ip port user pass layout subtype rotate rout
+  ip=$(jq -r '.nvrIp // empty' "$CONFIG")
+  port=$(jq -r '.nvrPort // 554' "$CONFIG")
+  user=$(jq -r '.nvrUser // empty' "$CONFIG")
+  pass=$(jq -r '.nvrPass // empty' "$CONFIG")
+  layout=$(jq -r '.layout // empty' "$CONFIG")
+  subtype=$(jq -r '.subtype // 1' "$CONFIG")
+  rotate=$(jq -r '.rotate // "none"' "$CONFIG")
+  rout=$(jq -r '.rotateOutput // empty' "$CONFIG")
+  local ch=()
+  readarray -t ch < <(jq -r '.channels[]?' "$CONFIG")
+
+  [[ -n $ip && -n $user && -n $pass ]] || { say "nvrIp/nvrUser/nvrPass missing"; return 1; }
+  local need
+  case $layout in 1) need=1 ;; 2h|2v) need=2 ;; 4) need=4 ;; *) say "bad layout '$layout'"; return 1 ;; esac
+  [[ ${#ch[@]} -eq $need ]] || { say "layout '$layout' needs $need channels, got ${#ch[@]}"; return 1; }
+  [[ $layout == 1 || $subtype == 1 ]] || subtype=1   # grids must use substreams
+
+  apply_rotation "$rotate" "$rout"
+
+  local url="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor"
+  local common=(--fs --no-osc --no-input-default-bindings --no-keepaspect --really-quiet
+                --hwdec=auto --profile=low-latency --rtsp-transport=tcp)
+  local args=()
+  case $layout in
+    1)
+      args=("${common[@]}"
+            "${url}?channel=${ch[0]}&subtype=${subtype}")
+      ;;
+    2h)
+      args=("${common[@]}"
+            "--lavfi-complex=[vid1][vid2]hstack[vo]"
+            "--external-file=${url}?channel=${ch[1]}&subtype=${subtype}"
+            "${url}?channel=${ch[0]}&subtype=${subtype}")
+      ;;
+    2v)
+      args=("${common[@]}"
+            "--lavfi-complex=[vid1][vid2]vstack[vo]"
+            "--external-file=${url}?channel=${ch[1]}&subtype=${subtype}"
+            "${url}?channel=${ch[0]}&subtype=${subtype}")
+      ;;
+    4)
+      args=("${common[@]}"
+            "--lavfi-complex=[vid1][vid2]hstack[top];[vid3][vid4]hstack[bottom];[top][bottom]vstack[vo]"
+            "--external-file=${url}?channel=${ch[1]}&subtype=${subtype}"
+            "--external-file=${url}?channel=${ch[2]}&subtype=${subtype}"
+            "--external-file=${url}?channel=${ch[3]}&subtype=${subtype}"
+            "${url}?channel=${ch[0]}&subtype=${subtype}")
+      ;;
+  esac
+
+  if [[ -n ${KIOSK_DRYRUN:-} ]]; then
+    printf 'MPV %s\n' "${args[@]}"
+    return 0
+  fi
+  mpv "${args[@]}"
+}
+
+if [[ -n ${KIOSK_DRYRUN:-} ]]; then
+  run_once
+  exit $?
+fi
+
+while true; do
+  if run_once; then
+    sleep 3    # mpv exited (stream drop or config reload) - quick respawn
+  else
+    sleep 5    # config missing/invalid - wait for the agent to fix it
+  fi
+done

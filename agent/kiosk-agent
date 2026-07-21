@@ -7,8 +7,10 @@
 #      rejected) using the enroll token from /etc/kiosk/agent.env.
 #   2. Polls the manager with our status; learns desired config/ssh-key
 #      versions and any queued commands.
-#   3. On config version drift: fetches config, renders cams.sh, restarts
-#      the display. On key version drift: fetches keys and applies them via
+#   3. On config version drift: fetches and validates config, then reloads
+#      the stream (kills mpv; cams.sh respawns it with the new config - X is
+#      not restarted, so changes appear in a few seconds without a black
+#      flash). On key version drift: fetches keys and applies them via
 #      kiosk-update-ssh-keys (which refuses empty lists - lockout safety).
 #   4. Installs the manager's SSH public key into the kiosk user's
 #      authorized_keys behind a forced command (sudo kiosk-trigger, allowed by
@@ -20,7 +22,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="1.2"
+AGENT_VERSION="1.3"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -83,25 +85,35 @@ apply_config() {
   local want=$1
   [[ $want =~ ^[0-9]+$ ]] && (( want > 0 )) || return 0
   [[ $want -ne $(applied_version applied-config-version) ]] || return 0
+  if [[ -z ${KIOSK_USER:-} ]]; then
+    log "config: KIOSK_USER not set (missing kiosk.conf?)"
+    return 0
+  fi
 
-  local out code ver
+  local out code ver layout nch need
   out=$(mktemp)
   code=$(http GET /api/agent/config "$out") || { rm -f "$out"; return 0; }
   [[ $code == 200 ]] || { log "config: HTTP $code"; rm -f "$out"; return 0; }
-  if ! jq -e '(.nvrIp | length > 0) and (.layout | length > 0) and (.channels | length > 0)' "$out" >/dev/null 2>&1; then
+  if ! jq -e '(.nvrIp | length > 0) and (.nvrUser | length > 0) and (.nvrPass | length > 0)' "$out" >/dev/null 2>&1; then
     log "config: payload failed validation - ignoring"
     rm -f "$out"; return 0
   fi
-  ver=$(jq -r '.version' "$out")
-  install -m 600 -o root -g root "$out" "$CONF_DIR/config.json"
-  rm -f "$out"
-  if kiosk-render-cams; then
-    systemctl restart kiosk-display
-    echo "$ver" > "$CONF_DIR/applied-config-version"
-    log "config: applied v$ver and restarted display"
-  else
-    log "config: render failed - previous display config kept, version not recorded"
+  layout=$(jq -r '.layout // empty' "$out")
+  nch=$(jq -r '.channels | length' "$out")
+  case $layout in 1) need=1 ;; 2h|2v) need=2 ;; 4) need=4 ;; *) need=-1 ;; esac
+  if [[ $need -lt 0 || $nch -ne $need ]]; then
+    log "config: layout '$layout' with $nch channel(s) is invalid - ignoring"
+    rm -f "$out"; return 0
   fi
+  ver=$(jq -r '.version' "$out")
+  # cams.sh (running as the kiosk user) reads this each mpv respawn
+  install -m 640 -o root -g "$KIOSK_USER" "$out" "$CONF_DIR/config.json"
+  rm -f "$out"
+  # Reload the stream only: kill mpv and let the cams.sh loop respawn it with
+  # the new config. X keeps running - no black flash, ~3-5 s to new video.
+  pkill -u "$KIOSK_USER" -x mpv 2>/dev/null || true
+  echo "$ver" > "$CONF_DIR/applied-config-version"
+  log "config: applied v$ver (stream reloading)"
 }
 
 apply_keys() {
@@ -238,17 +250,23 @@ tick() {
 
 # SIGUSR1 (sent by kiosk-trigger when the manager SSHes in) interrupts the
 # sleep so changes apply instantly instead of waiting out the poll interval.
+# A signal that lands while a tick is still running skips the sleep entirely,
+# so back-to-back pushes are never swallowed.
 WOKEN=0
 trap 'WOKEN=1' USR1
 
 log "kiosk-agent $AGENT_VERSION starting (poll every ${POLL_INTERVAL}s; SIGUSR1 forces an immediate sync)"
 while true; do
+  WOKEN=0
   TICK_START=$(date +%s)
   tick || true
+  if (( WOKEN )); then
+    log "sync: woken during tick - polling again"
+    continue
+  fi
   ELAPSED=$(( $(date +%s) - TICK_START ))
   REMAIN=$(( POLL_INTERVAL - ELAPSED ))
   (( REMAIN < 1 )) && REMAIN=1
-  WOKEN=0
   sleep "$REMAIN" &
   SLEEP_PID=$!
   if ! wait "$SLEEP_PID" 2>/dev/null; then

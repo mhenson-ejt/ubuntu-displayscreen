@@ -184,10 +184,21 @@ KIOSK_USER=$KIOSK_USER
 KIOSK_HOME=$KIOSK_HOME
 EOF
 
-log "Installing display renderer and display service..."
-fetch_file agent/kiosk-render-cams /usr/local/sbin/kiosk-render-cams 755
+log "Installing display loop and display service..."
+# cams.sh re-reads /etc/kiosk/config.json on every mpv respawn, so config
+# changes only need mpv killed - no X restart. Contains no secrets itself,
+# but only root and the kiosk user get to run it.
+fetch_file agent/kiosk-cams /etc/kiosk/cams.sh 750
+chown "root:$KIOSK_USER" /etc/kiosk/cams.sh
 fetch_file agent/kiosk-display.service /etc/systemd/system/kiosk-display.service 644
 sed -i "s/@KIOSK_USER@/$KIOSK_USER/" /etc/systemd/system/kiosk-display.service
+
+# Upgrade hygiene: the generated-cams.sh approach is gone
+rm -f /usr/local/sbin/kiosk-render-cams
+if [[ -f /etc/kiosk/config.json ]]; then
+  chown "root:$KIOSK_USER" /etc/kiosk/config.json
+  chmod 640 /etc/kiosk/config.json
+fi
 
 #--- SSH key updater (both modes) ----------------------------------------------
 # Managed mode: the agent calls it with a key file fetched from the manager.
@@ -257,6 +268,7 @@ EOF
   # Instant sync: the manager SSHes in as $KIOSK_USER and may run exactly one
   # command as root - the sync trigger. Validated before install so a bad rule
   # can never break sudo.
+  # (cams.sh waits for config.json by itself, so no placeholder is needed.)
   log "Installing sudoers rule for instant sync..."
   TMPS=$(mktemp)
   cat > "$TMPS" <<EOF
@@ -274,21 +286,6 @@ EOF
     sed -i '/# >>> kiosk-manager-key/,/# <<< kiosk-manager-key/d' /root/.ssh/authorized_keys
   fi
   rm -f /etc/kiosk/applied-managerkey-version
-
-  # Placeholder display until the first config arrives (don't clobber on re-run)
-  if [[ ! -f /etc/kiosk/cams.sh ]]; then
-    TMPC=$(mktemp)
-    cat > "$TMPC" <<'EOF'
-#!/bin/bash
-# Placeholder - replaced automatically when configuration arrives from the manager
-xset s off
-xset -dpms
-xset s noblank
-while true; do sleep 60; done
-EOF
-    install -m 750 -o root -g "$KIOSK_USER" "$TMPC" /etc/kiosk/cams.sh
-    rm -f "$TMPC"
-  fi
 
   # The manager supersedes the GitHub-hosted key list timer
   systemctl disable --now kiosk-ssh-keys.timer 2>/dev/null || true
@@ -320,9 +317,8 @@ else
           layout: $layout, channels: $channels, subtype: $subtype, rotate: $rotate,
           rotateOutput: (if $rout == "" then null else $rout end)}' \
         > /etc/kiosk/config.json
-  chmod 600 /etc/kiosk/config.json
-
-  /usr/local/sbin/kiosk-render-cams
+  chown "root:$KIOSK_USER" /etc/kiosk/config.json
+  chmod 640 /etc/kiosk/config.json
 
   # Hourly SSH key refresh from the repo's ssh-keys.txt
   log "Installing SSH key refresh timer (source: $SSH_KEYS_URL)..."
@@ -378,7 +374,7 @@ else
   echo "  NVR      : $NVR_IP:$NVR_PORT (user: $NVR_USER)"
   echo "  Rotation : $ROTATE"
   echo "  SSH keys : $SSH_KEYS_URL (refreshed hourly)"
-  echo "  Config   : /etc/kiosk/config.json (edit + run kiosk-render-cams && systemctl restart kiosk-display)"
+  echo "  Config   : /etc/kiosk/config.json (edit + 'pkill mpv' to apply)"
 fi
 echo
 echo "Reminders:"
