@@ -8,10 +8,20 @@
 # agent does `pkill mpv`) - the new settings are live in a few seconds with
 # no X restart and no black flash.
 #
+# Config shape (grid up to 6x6; tiles may come from different NVRs; grid
+# positions without a tile render black; every cell is scaled to a uniform
+# size so mixed camera resolutions are fine):
+#   { "gridCols": 3, "gridRows": 2, "subtype": 1,
+#     "rotate": "none", "rotateOutput": null,
+#     "tiles": [ {"pos": 0, "ip": "..", "port": 554,
+#                 "user": "..", "pass": "..", "channel": 1}, ... ] }
+#
 # Set KIOSK_DRYRUN=1 to print the xrandr/mpv commands instead of running them
 # (used by tests; no X or mpv needed).
 #===============================================================================
 CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
+CELL_W=640
+CELL_H=360
 
 say() { echo "kiosk-cams: $*" >&2; }
 
@@ -50,56 +60,90 @@ run_once() {
   [[ -r $CONFIG ]] || { say "waiting for $CONFIG"; return 1; }
   jq -e . "$CONFIG" >/dev/null 2>&1 || { say "config is not valid JSON"; return 1; }
 
-  local ip port user pass layout subtype rotate rout
-  ip=$(jq -r '.nvrIp // empty' "$CONFIG")
-  port=$(jq -r '.nvrPort // 554' "$CONFIG")
-  user=$(jq -r '.nvrUser // empty' "$CONFIG")
-  pass=$(jq -r '.nvrPass // empty' "$CONFIG")
-  layout=$(jq -r '.layout // empty' "$CONFIG")
+  local cols rows subtype rotate rout ntiles
+  cols=$(jq -r '.gridCols // 0' "$CONFIG")
+  rows=$(jq -r '.gridRows // 0' "$CONFIG")
   subtype=$(jq -r '.subtype // 1' "$CONFIG")
   rotate=$(jq -r '.rotate // "none"' "$CONFIG")
   rout=$(jq -r '.rotateOutput // empty' "$CONFIG")
-  local ch=()
-  readarray -t ch < <(jq -r '.channels[]?' "$CONFIG")
+  ntiles=$(jq -r '.tiles | length' "$CONFIG")
 
-  [[ -n $ip && -n $user && -n $pass ]] || { say "nvrIp/nvrUser/nvrPass missing"; return 1; }
-  local need
-  case $layout in 1) need=1 ;; 2h|2v) need=2 ;; 4) need=4 ;; *) say "bad layout '$layout'"; return 1 ;; esac
-  [[ ${#ch[@]} -eq $need ]] || { say "layout '$layout' needs $need channels, got ${#ch[@]}"; return 1; }
-  [[ $layout == 1 || $subtype == 1 ]] || subtype=1   # grids must use substreams
+  [[ $cols =~ ^[1-6]$ && $rows =~ ^[1-6]$ ]] || { say "gridCols/gridRows must be 1..6"; return 1; }
+  [[ $ntiles =~ ^[0-9]+$ ]] && (( ntiles >= 1 )) || { say "no tiles configured"; return 1; }
+  local n=$(( cols * rows ))
+  (( n == 1 )) || subtype=1   # grids must use substreams
+
+  # Per-position stream URL; tiles outside the grid are ignored
+  local url=()
+  local i pos ip port user pass ch fields
+  for (( i=0; i<ntiles; i++ )); do
+    # tr strips CRs so CRLF from any jq/file source can't corrupt the fields
+    readarray -t fields < <(jq -r ".tiles[$i] | .pos, .ip, .port, .user, .pass, .channel" "$CONFIG" | tr -d '\r')
+    pos=${fields[0]}; ip=${fields[1]}; port=${fields[2]}
+    user=${fields[3]}; pass=${fields[4]}; ch=${fields[5]}
+    [[ $pos =~ ^[0-9]+$ ]] && (( pos < n )) || continue
+    if [[ -z $ip || $ip == null || -z $user || $user == null || -z $pass || $pass == null ]]; then
+      say "tile $pos is missing ip/user/pass"; return 1
+    fi
+    [[ $ch =~ ^[0-9]+$ ]] && (( ch >= 1 )) || { say "tile $pos has an invalid channel"; return 1; }
+    url[$pos]="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor?channel=${ch}&subtype=${subtype}"
+  done
+
+  local have=0
+  for (( pos=0; pos<n; pos++ )); do [[ -n ${url[$pos]:-} ]] && have=1; done
+  (( have )) || { say "no tiles inside the ${cols}x${rows} grid"; return 1; }
 
   apply_rotation "$rotate" "$rout"
 
-  local url="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor"
   local common=(--fs --no-osc --no-input-default-bindings --no-keepaspect --really-quiet
                 --hwdec=auto --profile=low-latency --rtsp-transport=tcp)
-  local args=()
-  case $layout in
-    1)
-      args=("${common[@]}"
-            "${url}?channel=${ch[0]}&subtype=${subtype}")
-      ;;
-    2h)
-      args=("${common[@]}"
-            "--lavfi-complex=[vid1][vid2]hstack[vo]"
-            "--external-file=${url}?channel=${ch[1]}&subtype=${subtype}"
-            "${url}?channel=${ch[0]}&subtype=${subtype}")
-      ;;
-    2v)
-      args=("${common[@]}"
-            "--lavfi-complex=[vid1][vid2]vstack[vo]"
-            "--external-file=${url}?channel=${ch[1]}&subtype=${subtype}"
-            "${url}?channel=${ch[0]}&subtype=${subtype}")
-      ;;
-    4)
-      args=("${common[@]}"
-            "--lavfi-complex=[vid1][vid2]hstack[top];[vid3][vid4]hstack[bottom];[top][bottom]vstack[vo]"
-            "--external-file=${url}?channel=${ch[1]}&subtype=${subtype}"
-            "--external-file=${url}?channel=${ch[2]}&subtype=${subtype}"
-            "--external-file=${url}?channel=${ch[3]}&subtype=${subtype}"
-            "${url}?channel=${ch[0]}&subtype=${subtype}")
-      ;;
-  esac
+  local args=("${common[@]}")
+
+  if (( n == 1 )); then
+    args+=("${url[0]}")
+  else
+    # First camera position becomes mpv's main file (vid1); the rest are
+    # external files, numbered vid2.. in the order they are added.
+    local main=-1
+    for (( pos=0; pos<n; pos++ )); do
+      [[ -n ${url[$pos]:-} ]] && { main=$pos; break; }
+    done
+    local vid=() externals=() next=2
+    vid[$main]=1
+    for (( pos=0; pos<n; pos++ )); do
+      [[ -n ${url[$pos]:-} ]] || continue
+      (( pos == main )) && continue
+      vid[$pos]=$next
+      externals+=("--external-file=${url[$pos]}")
+      next=$(( next + 1 ))
+    done
+
+    # Filter graph: every cell scaled to a uniform size (mixed camera
+    # resolutions stack fine), empty cells filled with black.
+    local graph="" r c
+    for (( pos=0; pos<n; pos++ )); do
+      if [[ -n ${url[$pos]:-} ]]; then
+        graph+="[vid${vid[$pos]}]scale=${CELL_W}:${CELL_H}[t${pos}];"
+      else
+        graph+="color=c=black:s=${CELL_W}x${CELL_H}:r=10[t${pos}];"
+      fi
+    done
+    if (( rows == 1 )); then
+      for (( c=0; c<cols; c++ )); do graph+="[t${c}]"; done
+      graph+="hstack=inputs=${cols}[vo]"
+    elif (( cols == 1 )); then
+      for (( r=0; r<rows; r++ )); do graph+="[t${r}]"; done
+      graph+="vstack=inputs=${rows}[vo]"
+    else
+      for (( r=0; r<rows; r++ )); do
+        for (( c=0; c<cols; c++ )); do graph+="[t$(( r * cols + c ))]"; done
+        graph+="hstack=inputs=${cols}[row${r}];"
+      done
+      for (( r=0; r<rows; r++ )); do graph+="[row${r}]"; done
+      graph+="vstack=inputs=${rows}[vo]"
+    fi
+    args+=("--lavfi-complex=${graph}" "${externals[@]}" "${url[$main]}")
+  fi
 
   if [[ -n ${KIOSK_DRYRUN:-} ]]; then
     printf 'MPV %s\n' "${args[@]}"

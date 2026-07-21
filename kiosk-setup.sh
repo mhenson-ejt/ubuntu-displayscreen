@@ -312,13 +312,26 @@ EOF
 else
   #--- Standalone mode ---------------------------------------------------------
   log "Writing /etc/kiosk/config.json ..."
-  CHANNELS_JSON=$(printf '%s\n' "${CH[@]}" | jq -R 'tonumber' | jq -cs .)
-  jq -n --arg ip "$NVR_IP" --argjson port "$NVR_PORT" --arg user "$NVR_USER" \
-        --arg pass "$NVR_PASS" --arg layout "$LAYOUT" --argjson channels "$CHANNELS_JSON" \
+  case $LAYOUT in
+    1)  GRID_COLS=1; GRID_ROWS=1 ;;
+    2h) GRID_COLS=2; GRID_ROWS=1 ;;
+    2v) GRID_COLS=1; GRID_ROWS=2 ;;
+    4)  GRID_COLS=2; GRID_ROWS=2 ;;
+  esac
+  TILES_JSON=$(
+    i=0
+    for c in "${CH[@]}"; do
+      jq -n --argjson pos "$i" --arg ip "$NVR_IP" --argjson port "$NVR_PORT" \
+            --arg user "$NVR_USER" --arg pass "$NVR_PASS" --argjson ch "$c" \
+            '{pos: $pos, ip: $ip, port: $port, user: $user, pass: $pass, channel: $ch}'
+      i=$((i + 1))
+    done | jq -cs .
+  )
+  jq -n --argjson cols "$GRID_COLS" --argjson rows "$GRID_ROWS" \
         --argjson subtype "$SUBTYPE" --arg rotate "$ROTATE" --arg rout "${ROTATE_OUT:-}" \
-        '{version: 0, nvrIp: $ip, nvrPort: $port, nvrUser: $user, nvrPass: $pass,
-          layout: $layout, channels: $channels, subtype: $subtype, rotate: $rotate,
-          rotateOutput: (if $rout == "" then null else $rout end)}' \
+        --argjson tiles "$TILES_JSON" \
+        '{version: 0, gridCols: $cols, gridRows: $rows, subtype: $subtype, rotate: $rotate,
+          rotateOutput: (if $rout == "" then null else $rout end), tiles: $tiles}' \
         > /etc/kiosk/config.json
   chown "root:$KIOSK_USER" /etc/kiosk/config.json
   chmod 640 /etc/kiosk/config.json

@@ -22,7 +22,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="1.3"
+AGENT_VERSION="1.4"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -90,19 +90,13 @@ apply_config() {
     return 0
   fi
 
-  local out code ver layout nch need
+  local out code ver
   out=$(mktemp)
   code=$(http GET /api/agent/config "$out") || { rm -f "$out"; return 0; }
   [[ $code == 200 ]] || { log "config: HTTP $code"; rm -f "$out"; return 0; }
-  if ! jq -e '(.nvrIp | length > 0) and (.nvrUser | length > 0) and (.nvrPass | length > 0)' "$out" >/dev/null 2>&1; then
+  if ! jq -e '(.gridCols >= 1 and .gridCols <= 6) and (.gridRows >= 1 and .gridRows <= 6)
+              and (.tiles | length >= 1)' "$out" >/dev/null 2>&1; then
     log "config: payload failed validation - ignoring"
-    rm -f "$out"; return 0
-  fi
-  layout=$(jq -r '.layout // empty' "$out")
-  nch=$(jq -r '.channels | length' "$out")
-  case $layout in 1) need=1 ;; 2h|2v) need=2 ;; 4) need=4 ;; *) need=-1 ;; esac
-  if [[ $need -lt 0 || $nch -ne $need ]]; then
-    log "config: layout '$layout' with $nch channel(s) is invalid - ignoring"
     rm -f "$out"; return 0
   fi
   ver=$(jq -r '.version' "$out")
