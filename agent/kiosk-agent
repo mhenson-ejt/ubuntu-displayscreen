@@ -22,7 +22,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="1.4"
+AGENT_VERSION="1.5"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -103,6 +103,21 @@ apply_config() {
   # cams.sh (running as the kiosk user) reads this each mpv respawn
   install -m 640 -o root -g "$KIOSK_USER" "$out" "$CONF_DIR/config.json"
   rm -f "$out"
+
+  # Fleet WiFi (wifiSsid/wifiPassword; nullable, additive - older managers never
+  # send them). kiosk-apply-wifi is idempotent (no netplan churn when unchanged)
+  # and keeps wired preferred via route metric; blank/absent SSID clears it.
+  if command -v kiosk-apply-wifi >/dev/null 2>&1; then
+    local wifi_ssid wifi_pass
+    wifi_ssid=$(jq -r '.wifiSsid // empty' "$CONF_DIR/config.json")
+    wifi_pass=$(jq -r '.wifiPassword // empty' "$CONF_DIR/config.json")
+    if [[ -n $wifi_ssid ]]; then
+      kiosk-apply-wifi "$wifi_ssid" "$wifi_pass" || log "wifi: apply failed - display continues on current network"
+    else
+      kiosk-apply-wifi --clear || true
+    fi
+  fi
+
   # Reload the stream only: kill mpv and let the cams.sh loop respawn it with
   # the new config. X keeps running - no black flash, ~3-5 s to new video.
   pkill -u "$KIOSK_USER" -x mpv 2>/dev/null || true

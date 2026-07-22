@@ -24,6 +24,11 @@
 #   STANDALONE  - set to 1 to force standalone mode
 #   SCRIPT_BASE_URL - where to fetch agent/* support files (default: this
 #                 repo's raw GitHub URL; a local checkout is used if present)
+#   WIFI_SSID   - optional: WiFi network to configure at install time (needed
+#                 for screens that will run WiFi-only; wired stays preferred
+#                 whenever a cable is connected). In managed mode the manager's
+#                 fleet-wide WiFi setting overwrites this on the first sync.
+#   WIFI_PASS   - WiFi password (omit for an open network)
 #
 # Standalone-only env vars / prompts:
 #   NVR_IP      - IP address of the Dahua NVR
@@ -154,7 +159,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo \
-  openssh-server curl ca-certificates jq
+  openssh-server curl ca-certificates jq wpasupplicant
 
 #--- Groups & X wrapper --------------------------------------------------------
 log "Configuring user groups and X permissions..."
@@ -198,6 +203,21 @@ rm -f /usr/local/sbin/kiosk-render-cams
 if [[ -f /etc/kiosk/config.json ]]; then
   chown "root:$KIOSK_USER" /etc/kiosk/config.json
   chmod 640 /etc/kiosk/config.json
+fi
+
+#--- WiFi (both modes) ----------------------------------------------------------
+# kiosk-apply-wifi keeps WiFi permanently configured at a worse route metric
+# than wired, so wired is used whenever a cable is connected and WiFi covers
+# everything else (including WiFi-only screens). In managed mode the agent
+# re-applies whatever the manager distributes; WIFI_SSID here just gets a
+# WiFi-only screen onto the network for its first sync.
+log "Installing WiFi helper..."
+fetch_file agent/kiosk-apply-wifi /usr/local/sbin/kiosk-apply-wifi 755
+
+if [[ -n ${WIFI_SSID:-} ]]; then
+  log "Configuring WiFi (\"$WIFI_SSID\")..."
+  /usr/local/sbin/kiosk-apply-wifi "$WIFI_SSID" "${WIFI_PASS:-}" \
+    || warn "WiFi configuration failed - continuing (wired still works; fix and re-run kiosk-apply-wifi)"
 fi
 
 #--- SSH key updater (both modes) ----------------------------------------------
