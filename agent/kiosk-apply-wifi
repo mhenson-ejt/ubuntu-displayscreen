@@ -21,7 +21,10 @@ set -euo pipefail
 
 YAML=/etc/netplan/90-kiosk-wifi.yaml
 WAIT_ONLINE_DIR=/etc/systemd/system/systemd-networkd-wait-online.service.d
-WAIT_ONLINE_CONF=$WAIT_ONLINE_DIR/10-kiosk-any.conf
+# 99- so it sorts (and therefore applies) AFTER netplan's own auto-generated 10-netplan.conf,
+# which pins the wait to the non-optional (wired) interface and would otherwise clear our lines
+WAIT_ONLINE_CONF=$WAIT_ONLINE_DIR/99-kiosk-any.conf
+WAIT_ONLINE_CONF_LEGACY=$WAIT_ONLINE_DIR/10-kiosk-any.conf
 
 log() { echo "kiosk-apply-wifi: $*"; }
 
@@ -29,11 +32,14 @@ log() { echo "kiosk-apply-wifi: $*"; }
 # wait-online defaults to requiring ALL managed interfaces, so an unplugged cable would hold boot
 # for its ~2 min timeout. --any is correct whenever WiFi is configured; removed again on --clear.
 install_wait_online_any() {
+  rm -f "$WAIT_ONLINE_CONF_LEGACY"
   [[ -f $WAIT_ONLINE_CONF ]] && return 0
   mkdir -p "$WAIT_ONLINE_DIR"
   cat > "$WAIT_ONLINE_CONF" <<'EOF'
 # Installed by kiosk-apply-wifi: with wired + WiFi both managed, boot must proceed when EITHER
 # is online (an unplugged cable would otherwise stall boot for the wait-online timeout).
+# Named 99- so it applies after netplan's auto-generated 10-netplan.conf, whose ExecStart= clear
+# would otherwise discard this and pin the wait to the wired interface again.
 [Service]
 ExecStart=
 ExecStart=/lib/systemd/systemd-networkd-wait-online --any
@@ -43,8 +49,8 @@ EOF
 }
 
 remove_wait_online_any() {
-  [[ -f $WAIT_ONLINE_CONF ]] || return 0
-  rm -f "$WAIT_ONLINE_CONF"
+  [[ -f $WAIT_ONLINE_CONF || -f $WAIT_ONLINE_CONF_LEGACY ]] || return 0
+  rm -f "$WAIT_ONLINE_CONF" "$WAIT_ONLINE_CONF_LEGACY"
   rmdir --ignore-fail-on-non-empty "$WAIT_ONLINE_DIR"
   systemctl daemon-reload
   log "wait-online restored to default"
