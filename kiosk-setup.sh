@@ -274,6 +274,16 @@ if [[ -n ${WIFI_SSID:-} ]]; then
   log "Configuring WiFi (\"$WIFI_SSID\")..."
   /usr/local/sbin/kiosk-apply-wifi "$WIFI_SSID" "${WIFI_PASS:-}" \
     || warn "WiFi configuration failed - continuing (wired still works; fix and re-run kiosk-apply-wifi)"
+elif [[ -f /etc/kiosk/config.json ]]; then
+  # Upgrade runs: re-assert the WiFi the manager last distributed (including the wait-online
+  # override), so helper improvements take effect without waiting for a config version bump.
+  KIOSK_WIFI_SSID=$(jq -r '.wifiSsid // empty' /etc/kiosk/config.json 2>/dev/null || true)
+  if [[ -n $KIOSK_WIFI_SSID ]]; then
+    log "Re-applying WiFi from cached config (\"$KIOSK_WIFI_SSID\")..."
+    /usr/local/sbin/kiosk-apply-wifi "$KIOSK_WIFI_SSID" \
+      "$(jq -r '.wifiPassword // empty' /etc/kiosk/config.json 2>/dev/null || true)" \
+      || warn "WiFi re-apply failed - continuing (the agent retries on the next config change)"
+  fi
 fi
 
 #--- SSH key updater (both modes) ----------------------------------------------
