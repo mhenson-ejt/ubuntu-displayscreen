@@ -20,10 +20,38 @@
 set -euo pipefail
 
 YAML=/etc/netplan/90-kiosk-wifi.yaml
+WAIT_ONLINE_DIR=/etc/systemd/system/systemd-networkd-wait-online.service.d
+WAIT_ONLINE_CONF=$WAIT_ONLINE_DIR/10-kiosk-any.conf
 
 log() { echo "kiosk-apply-wifi: $*"; }
 
+# With two managed paths (wired + WiFi), booting with either one up must not stall on the other:
+# wait-online defaults to requiring ALL managed interfaces, so an unplugged cable would hold boot
+# for its ~2 min timeout. --any is correct whenever WiFi is configured; removed again on --clear.
+install_wait_online_any() {
+  [[ -f $WAIT_ONLINE_CONF ]] && return 0
+  mkdir -p "$WAIT_ONLINE_DIR"
+  cat > "$WAIT_ONLINE_CONF" <<'EOF'
+# Installed by kiosk-apply-wifi: with wired + WiFi both managed, boot must proceed when EITHER
+# is online (an unplugged cable would otherwise stall boot for the wait-online timeout).
+[Service]
+ExecStart=
+ExecStart=/lib/systemd/systemd-networkd-wait-online --any
+EOF
+  systemctl daemon-reload
+  log "wait-online set to --any (boot proceeds when either network path is up)"
+}
+
+remove_wait_online_any() {
+  [[ -f $WAIT_ONLINE_CONF ]] || return 0
+  rm -f "$WAIT_ONLINE_CONF"
+  rmdir --ignore-fail-on-non-empty "$WAIT_ONLINE_DIR"
+  systemctl daemon-reload
+  log "wait-online restored to default"
+}
+
 if [[ ${1:-} == --clear ]]; then
+  remove_wait_online_any
   if [[ -f $YAML ]]; then
     rm -f "$YAML"
     netplan apply
@@ -86,12 +114,14 @@ trap 'rm -f "$TMP"' EXIT
 } > "$TMP"
 
 if [[ -f $YAML ]] && cmp -s "$TMP" "$YAML"; then
-  exit 0   # unchanged - no netplan apply, no network blip
+  install_wait_online_any   # boxes configured by an older helper version still need the override
+  exit 0                    # unchanged - no netplan apply, no network blip
 fi
 
 install -m 600 -o root -g root "$TMP" "$YAML"
 
 if netplan apply 2>&1; then
+  install_wait_online_any
   log "WiFi configured for \"$SSID\" (wired stays preferred when connected)"
 else
   # a bad apply must not leave a broken file for the next boot

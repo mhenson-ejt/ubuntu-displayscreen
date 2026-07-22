@@ -22,7 +22,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="1.6"
+AGENT_VERSION="1.7"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -228,10 +228,26 @@ handle_command() {
   esac
 }
 
+# Streams are TCP-bound to the source address of the interface they started on. When the default
+# route moves (cable pulled -> WiFi takes over, or cable returns), those connections are dead but
+# mpv only notices via its network timeout. Detect the flip each tick and reload the stream
+# immediately - cams.sh respawns mpv, which reconnects over the now-active path.
+check_route_flip() {
+  local dev
+  dev=$(ip -o route show default 2>/dev/null | head -1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+  if [[ -n ${LAST_ROUTE_DEV:-} && -n $dev && $dev != "$LAST_ROUTE_DEV" ]]; then
+    log "network: default route moved $LAST_ROUTE_DEV -> $dev - reloading streams"
+    [[ -n ${KIOSK_USER:-} ]] && pkill -u "$KIOSK_USER" -x mpv 2>/dev/null
+  fi
+  [[ -n $dev ]] && LAST_ROUTE_DEV=$dev
+  return 0
+}
+
 tick() {
   unset API_TOKEN SCREEN_ID
   source "$ENV_FILE" 2>/dev/null || { log "missing $ENV_FILE"; return; }
   source "$CONF_DIR/kiosk.conf" 2>/dev/null || true   # KIOSK_USER, KIOSK_HOME
+  check_route_flip
   [[ -n ${MANAGER_URL:-} ]] || { log "no MANAGER_URL in $ENV_FILE"; return; }
   MANAGER_URL=${MANAGER_URL%/}
 

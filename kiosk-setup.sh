@@ -182,7 +182,7 @@ APT_OPTS=(-y -o DPkg::Lock::Timeout=600
           -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
 REQUIRED_PKGS=(xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo
-               openssh-server curl ca-certificates jq wpasupplicant)
+               openssh-server curl ca-certificates jq wpasupplicant iw)
 MISSING_PKGS=()
 for p in "${REQUIRED_PKGS[@]}"; do
   dpkg -s "$p" >/dev/null 2>&1 || MISSING_PKGS+=("$p")

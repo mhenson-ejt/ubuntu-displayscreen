@@ -100,8 +100,11 @@ run_once() {
   # until the next keyframe. A small demuxer cache (instead of the previous
   # low-latency profile) absorbs network/CPU hiccups; ~1s extra latency is
   # invisible on a wall display.
+  # network-timeout: a dead TCP connection (NVR gone, or the default route moved to another
+  # interface, e.g. wired -> WiFi failover) makes mpv exit within ~15s so the respawn loop
+  # reconnects over the live path, instead of freezing on the last frame forever.
   local common=(--fs --no-osc --no-input-default-bindings --no-keepaspect --really-quiet
-                --hwdec=auto --rtsp-transport=tcp
+                --hwdec=auto --rtsp-transport=tcp --network-timeout=15
                 --demuxer-lavf-o-add=fflags=+discardcorrupt
                 --cache=yes --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
   local args=("${common[@]}")
