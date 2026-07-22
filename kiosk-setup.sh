@@ -174,16 +174,48 @@ fi
 #   - NEEDRESTART_MODE=a stops needrestart's service-restart dialog on 22.04+
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
+# Acquire timeouts: a mirror that can't be reached (e.g. a site firewall dropping plain HTTP :80,
+# which Ubuntu's default archive URLs use) fails within ~a minute with a clear error instead of
+# hanging in TCP retry limbo.
 APT_OPTS=(-y -o DPkg::Lock::Timeout=600
+          -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2
           -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-APT_START=$(date +%s)
-log "apt: refreshing package lists (waits for any other apt/unattended-upgrade run to finish first)..."
-apt-get "${APT_OPTS[@]}" -qq update
-log "apt: installing/upgrading packages..."
-apt-get "${APT_OPTS[@]}" -q install --no-install-recommends \
-  xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo \
-  openssh-server curl ca-certificates jq wpasupplicant
-log "apt: done in $(( $(date +%s) - APT_START ))s"
+
+REQUIRED_PKGS=(xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo
+               openssh-server curl ca-certificates jq wpasupplicant)
+MISSING_PKGS=()
+for p in "${REQUIRED_PKGS[@]}"; do
+  dpkg -s "$p" >/dev/null 2>&1 || MISSING_PKGS+=("$p")
+done
+
+if (( ${#MISSING_PKGS[@]} == 0 )); then
+  # Upgrade re-runs (including the agent's remote self-update) don't need apt at all - only the
+  # kiosk files change. This keeps updates working at sites whose firewalls block the Ubuntu
+  # mirrors; package updates are the OS's business (unattended-upgrades), not this script's.
+  log "apt: all required packages already installed - skipping"
+else
+  log "apt: missing packages: ${MISSING_PKGS[*]}"
+
+  # Pre-flight: fail fast and helpfully when the mirrors are unreachable
+  if ! curl -m 8 -sfI http://archive.ubuntu.com/ubuntu/ >/dev/null 2>&1; then
+    if curl -m 8 -sfI https://archive.ubuntu.com/ubuntu/ >/dev/null 2>&1; then
+      warn "archive.ubuntu.com is unreachable over HTTP but fine over HTTPS - this site's firewall"
+      warn "likely blocks port 80. Switch apt to HTTPS mirrors and re-run:"
+      warn "  sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources"
+      die "apt mirrors unreachable over HTTP"
+    fi
+    warn "archive.ubuntu.com is unreachable over HTTP and HTTPS - if this site's egress is"
+    warn "allowlisted, allow archive.ubuntu.com + security.ubuntu.com (or install on a network"
+    warn "that can reach them). Attempting apt anyway..."
+  fi
+
+  APT_START=$(date +%s)
+  log "apt: refreshing package lists (waits for any other apt/unattended-upgrade run to finish first)..."
+  apt-get "${APT_OPTS[@]}" -qq update
+  log "apt: installing packages..."
+  apt-get "${APT_OPTS[@]}" -q install --no-install-recommends "${REQUIRED_PKGS[@]}"
+  log "apt: done in $(( $(date +%s) - APT_START ))s"
+fi
 
 #--- Groups & X wrapper --------------------------------------------------------
 log "Configuring user groups and X permissions..."
