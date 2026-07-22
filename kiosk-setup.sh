@@ -154,10 +154,19 @@ if [[ $MODE == standalone ]]; then
 fi
 
 #--- Install packages ----------------------------------------------------------
-log "Installing packages..."
+# Hardened for unattended runs (curl | bash, and the agent's remote self-update):
+#   - DPkg::Lock::Timeout waits out unattended-upgrades instead of failing/hanging silently
+#   - force-confdef/confold answer dpkg conffile prompts (we deliberately overwrite
+#     /etc/X11/Xwrapper.config, a conffile of xserver-xorg-legacy - upgrades of that package
+#     would otherwise sit on an invisible "keep or replace?" prompt forever)
+#   - NEEDRESTART_MODE=a stops needrestart's service-restart dialog on 22.04+
+log "Installing packages (waits for any other apt/unattended-upgrade run to finish first)..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
+export NEEDRESTART_MODE=a
+APT_OPTS=(-y -qq -o DPkg::Lock::Timeout=600
+          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+apt-get "${APT_OPTS[@]}" update
+apt-get "${APT_OPTS[@]}" install --no-install-recommends \
   xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo \
   openssh-server curl ca-certificates jq wpasupplicant
 
