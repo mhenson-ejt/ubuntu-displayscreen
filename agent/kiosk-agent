@@ -22,7 +22,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="1.5"
+AGENT_VERSION="1.6"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -209,6 +209,18 @@ handle_command() {
       # Ack first, then reboot detached so the ack and this loop aren't killed mid-flight
       ack "$id" ok "rebooting"
       systemd-run --on-active=5 systemctl reboot >/dev/null 2>&1 || systemctl reboot
+      ;;
+    update-agent)
+      # Self-update: re-run the installer from the repo. Ack first (the installer restarts this
+      # service), and run DETACHED in a transient unit (own cgroup) so 'systemctl restart
+      # kiosk-agent' inside the installer doesn't kill the update mid-run. The installer preserves
+      # our API token, so no re-registration happens. The new version shows on the next poll.
+      ack "$id" ok "updating from v$AGENT_VERSION"
+      local update_base=${SCRIPT_BASE_URL:-https://raw.githubusercontent.com/mhenson-ejt/ubuntu-displayscreen/main}
+      systemd-run --unit=kiosk-agent-update --collect \
+        bash -c "sleep 2; curl -fsSL '$update_base/kiosk-setup.sh' | MANAGER_URL='$MANAGER_URL' ENROLL_TOKEN='${ENROLL_TOKEN:-}' KIOSK_USER='${KIOSK_USER:-viewer}' SCRIPT_BASE_URL='$update_base' bash" \
+        >/dev/null 2>&1 \
+        || ack "$id" error "failed to launch the updater (see journalctl -u kiosk-agent-update)"
       ;;
     *)
       ack "$id" error "unknown command type: $type"

@@ -86,9 +86,16 @@ it's not — no failover logic, and WiFi-only screens simply run on WiFi.
 
 ## Upgrading
 
-Re-run the same install command. The script is idempotent: it refreshes the
-agent and support files, migrates state from older layouts, and restarts the
-services with the new code. Managed screens keep their enrollment.
+**From the manager (agent v1.6+):** every screen has an "Update agent" button
+on its detail page, and the Screens page offers a bulk "Update outdated
+agents" button. The screen re-runs this repo's installer on itself (detached,
+so the display keeps running) and reports its new version on the next poll.
+Screens still on an older agent need one manual re-run to gain the feature.
+
+**By hand:** re-run the same install command. The script is idempotent: it
+refreshes the agent and support files, migrates state from older layouts, and
+restarts the services with the new code. Screens keep their enrollment and
+API token across re-runs.
 
 ## Verify / troubleshoot
 

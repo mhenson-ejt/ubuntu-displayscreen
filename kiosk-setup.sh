@@ -275,10 +275,20 @@ if [[ $MODE == managed ]]; then
   #--- Managed mode ------------------------------------------------------------
   log "Configuring managed mode (manager: $MANAGER_URL)..."
 
+  # Preserve enrollment across upgrade re-runs (including remote 'update-agent' commands): the
+  # screen keeps its API token and identity, so it never re-registers - important because the
+  # stored enroll token may have been rotated on the manager since the original install.
+  OLD_API_TOKEN=$(grep '^API_TOKEN=' /etc/kiosk/agent.env 2>/dev/null | cut -d= -f2- || true)
+  OLD_SCREEN_ID=$(grep '^SCREEN_ID=' /etc/kiosk/agent.env 2>/dev/null | cut -d= -f2- || true)
+
   cat > /etc/kiosk/agent.env <<EOF
 MANAGER_URL=$MANAGER_URL
 ENROLL_TOKEN=$ENROLL_TOKEN
+SCRIPT_BASE_URL=$SCRIPT_BASE_URL
 EOF
+  if [[ -n $OLD_API_TOKEN ]]; then
+    printf 'API_TOKEN=%s\nSCREEN_ID=%s\n' "$OLD_API_TOKEN" "$OLD_SCREEN_ID" >> /etc/kiosk/agent.env
+  fi
   chmod 600 /etc/kiosk/agent.env
 
   fetch_file agent/kiosk-agent /usr/local/sbin/kiosk-agent 755
