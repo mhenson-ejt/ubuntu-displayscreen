@@ -45,15 +45,24 @@
 #===============================================================================
 set -euo pipefail
 
-log()  { echo -e "\e[1;32m[kiosk]\e[0m $*"; }
-warn() { echo -e "\e[1;33m[kiosk]\e[0m $*"; }
-die()  { echo -e "\e[1;31m[kiosk]\e[0m $*" >&2; exit 1; }
+log()  { echo -e "\e[1;32m[kiosk]\e[0m $(date +%H:%M:%S) $*"; }
+warn() { echo -e "\e[1;33m[kiosk]\e[0m $(date +%H:%M:%S) $*"; }
+die()  { echo -e "\e[1;31m[kiosk]\e[0m $(date +%H:%M:%S) $*${LOG_FILE:+  (full log: $LOG_FILE)}" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Run with sudo: sudo bash $0"
 
 # When piped via curl, stdin is the script itself - read prompts from the terminal
 TTY=/dev/tty
 [[ -e $TTY && -r $TTY ]] || TTY=/dev/stdin
+
+# Capture EVERYTHING (including apt/dpkg output) to a persistent log so a stuck or failed run - manual
+# or headless via the agent's remote update - can always be diagnosed after the fact.
+LOG_FILE=/var/log/kiosk-setup.log
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=== kiosk-setup run started $(date -Is) ==="
+
+# set -e means any unhandled failure stops the script; say exactly where before dying
+trap 'echo -e "\e[1;31m[kiosk]\e[0m FAILED at line $LINENO running: $BASH_COMMAND  (full log: $LOG_FILE)"' ERR
 
 ask() { # ask VAR "Prompt" "default"
   local var=$1 prompt=$2 def=${3:-}
@@ -76,10 +85,13 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")
 fetch_file() { # fetch_file <repo-relative-path> <dest> <mode>
   local rel=$1 dest=$2 mode=$3
   if [[ -n $SCRIPT_DIR && -f $SCRIPT_DIR/$rel ]]; then
+    log "  $rel -> $dest (local checkout)"
     install -m "$mode" "$SCRIPT_DIR/$rel" "$dest"
   else
+    log "  $rel -> $dest (downloading)"
     local tmp; tmp=$(mktemp)
-    curl -fsSL "$SCRIPT_BASE_URL/$rel" -o "$tmp" || die "Failed to download $SCRIPT_BASE_URL/$rel"
+    curl -fsSL --connect-timeout 10 --max-time 120 "$SCRIPT_BASE_URL/$rel" -o "$tmp" \
+      || die "Failed to download $SCRIPT_BASE_URL/$rel"
     install -m "$mode" "$tmp" "$dest"
     rm -f "$tmp"
   fi
@@ -160,15 +172,18 @@ fi
 #     /etc/X11/Xwrapper.config, a conffile of xserver-xorg-legacy - upgrades of that package
 #     would otherwise sit on an invisible "keep or replace?" prompt forever)
 #   - NEEDRESTART_MODE=a stops needrestart's service-restart dialog on 22.04+
-log "Installing packages (waits for any other apt/unattended-upgrade run to finish first)..."
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-APT_OPTS=(-y -qq -o DPkg::Lock::Timeout=600
+APT_OPTS=(-y -o DPkg::Lock::Timeout=600
           -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-apt-get "${APT_OPTS[@]}" update
-apt-get "${APT_OPTS[@]}" install --no-install-recommends \
+APT_START=$(date +%s)
+log "apt: refreshing package lists (waits for any other apt/unattended-upgrade run to finish first)..."
+apt-get "${APT_OPTS[@]}" -qq update
+log "apt: installing/upgrading packages..."
+apt-get "${APT_OPTS[@]}" -q install --no-install-recommends \
   xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo \
   openssh-server curl ca-certificates jq wpasupplicant
+log "apt: done in $(( $(date +%s) - APT_START ))s"
 
 #--- Groups & X wrapper --------------------------------------------------------
 log "Configuring user groups and X permissions..."
@@ -419,7 +434,7 @@ else
 fi
 
 #--- Done ----------------------------------------------------------------------
-log "Setup complete."
+log "Setup complete. (full log: $LOG_FILE)"
 echo
 if [[ $MODE == managed ]]; then
   echo "  Mode     : managed by $MANAGER_URL"
