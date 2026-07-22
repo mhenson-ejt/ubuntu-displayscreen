@@ -44,15 +44,20 @@ if [[ -n $PSK && ( ${#PSK} -lt 8 || ${#PSK} -gt 63 ) ]]; then
 fi
 
 # netplan's networkd backend requires WiFi devices by literal interface name (match: is not
-# supported for wifis) - detect it at apply time
-WLAN=$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')
-if [[ -z $WLAN ]]; then
-  WLAN=$(ls /sys/class/net 2>/dev/null | grep '^wl' | head -1 || true)
-fi
+# supported for wifis) - detect it at apply time. Pure sysfs: no dependency on iw/wireless-tools,
+# which minimal server installs don't have.
+WLAN=""
+for dev in /sys/class/net/*; do
+  if [[ -d $dev/wireless ]]; then
+    WLAN=$(basename "$dev")
+    break
+  fi
+done
 if [[ -z $WLAN ]]; then
   log "no WiFi interface found on this machine - nothing to configure"
   exit 0
 fi
+log "using WiFi interface $WLAN"
 
 # escape for double-quoted YAML scalars
 esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
