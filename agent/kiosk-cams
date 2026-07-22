@@ -103,7 +103,9 @@ run_once() {
   # network-timeout: a dead TCP connection (NVR gone, or the default route moved to another
   # interface, e.g. wired -> WiFi failover) makes mpv exit within ~15s so the respawn loop
   # reconnects over the live path, instead of freezing on the last frame forever.
-  local common=(--fs --no-osc --no-input-default-bindings --no-keepaspect --really-quiet
+  # msg-level (not really-quiet): real errors reach the journal so a sick stream is diagnosable.
+  local common=(--fs --no-osc --no-input-default-bindings --no-keepaspect
+                --msg-level=all=error
                 --hwdec=auto --rtsp-transport=tcp --network-timeout=15
                 --demuxer-lavf-o-add=fflags=+discardcorrupt
                 --cache=yes --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
@@ -168,9 +170,11 @@ if [[ -n ${KIOSK_DRYRUN:-} ]]; then
 fi
 
 while true; do
+  say "starting player"
   if run_once; then
-    sleep 3    # mpv exited (stream drop or config reload) - quick respawn
+    say "player exited (stream drop or config reload) - respawning"
+    sleep 3
   else
-    sleep 5    # config missing/invalid - wait for the agent to fix it
+    sleep 5    # config missing/invalid - wait for the agent to fix it (reason already logged)
   fi
 done

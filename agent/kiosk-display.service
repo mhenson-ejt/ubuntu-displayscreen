@@ -1,7 +1,11 @@
 [Unit]
 Description=Kiosk camera display (X + mpv)
 Conflicts=getty@tty1.service
-After=systemd-user-sessions.service getty@tty1.service
+# network-online: never start mpv against a half-up network (a tile whose connection dies mid-
+# handshake stalls the whole filter graph with no exit - a frozen wall). With the kiosk wait-online
+# override (--any) this only waits until EITHER wired or WiFi is up: seconds, not the 2-min default.
+Wants=network-online.target
+After=systemd-user-sessions.service getty@tty1.service network-online.target
 
 [Service]
 User=@KIOSK_USER@
