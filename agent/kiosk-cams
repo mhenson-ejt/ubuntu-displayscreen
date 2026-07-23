@@ -23,7 +23,14 @@ CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
 CELL_W=640
 CELL_H=360
 
-say() { echo "kiosk-cams: $*" >&2; }
+# logger, not stderr: startx swallows the X clients' stderr, so journald never saw these
+say() { logger -t kiosk-cams -- "$*" 2>/dev/null; echo "kiosk-cams: $*" >&2; }
+
+# TCP probe so an unreachable NVR degrades to black cells instead of stalling the whole
+# filter graph (one input with no frames freezes hstack/vstack - the entire wall)
+reachable() { # reachable IP PORT
+  timeout 3 bash -c "echo > /dev/tcp/$1/$2" 2>/dev/null
+}
 
 if [[ -z ${KIOSK_DRYRUN:-} ]]; then
   export LIBVA_DRIVER_NAME=i965
@@ -73,7 +80,10 @@ run_once() {
   local n=$(( cols * rows ))
   (( n == 1 )) || subtype=1   # grids must use substreams
 
-  # Per-position stream URL; tiles outside the grid are ignored
+  # Per-position stream URL; tiles outside the grid are ignored. Tiles whose NVR is unreachable
+  # right now render black this cycle instead of stalling the graph; DEGRADED makes the caller
+  # time-limit mpv so those tiles retry automatically.
+  DEGRADED=0
   local url=()
   local i pos ip port user pass ch fields
   for (( i=0; i<ntiles; i++ )); do
@@ -86,6 +96,11 @@ run_once() {
       say "tile $pos is missing ip/user/pass"; return 1
     fi
     [[ $ch =~ ^[0-9]+$ ]] && (( ch >= 1 )) || { say "tile $pos has an invalid channel"; return 1; }
+    if [[ -z ${KIOSK_DRYRUN:-} ]] && ! reachable "$ip" "$port"; then
+      say "tile $pos: NVR $ip:$port unreachable - showing black, retrying periodically"
+      DEGRADED=1
+      continue
+    fi
     url[$pos]="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor?channel=${ch}&subtype=${subtype}"
   done
 
@@ -161,7 +176,13 @@ run_once() {
     printf 'MPV %s\n' "${args[@]}"
     return 0
   fi
-  mpv "${args[@]}"
+  if (( DEGRADED )); then
+    # some tiles are blacked out - time-limit this session so they retry every 5 minutes
+    # (a respawn is a ~3s flash; only happens while degraded)
+    timeout 300 mpv "${args[@]}"
+  else
+    mpv "${args[@]}"
+  fi
 }
 
 if [[ -n ${KIOSK_DRYRUN:-} ]]; then
