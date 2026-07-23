@@ -14,7 +14,9 @@
 #   { "gridCols": 3, "gridRows": 2, "subtype": 1,
 #     "rotate": "none", "rotateOutput": null,
 #     "tiles": [ {"pos": 0, "ip": "..", "port": 554,
-#                 "user": "..", "pass": "..", "channel": 1}, ... ] }
+#                 "user": "..", "pass": "..", "channel": 1, "subtype": 0}, ... ] }
+# Per-tile "subtype" (0 = main stream, 1 = substream) overrides the top-level
+# default for that camera; tiles without it use the top-level "subtype".
 #
 # Set KIOSK_DRYRUN=1 to print the xrandr/mpv commands instead of running them
 # (used by tests; no X or mpv needed).
@@ -78,19 +80,19 @@ run_once() {
   [[ $cols =~ ^[1-6]$ && $rows =~ ^[1-6]$ ]] || { say "gridCols/gridRows must be 1..6"; return 1; }
   [[ $ntiles =~ ^[0-9]+$ ]] && (( ntiles >= 1 )) || { say "no tiles configured"; return 1; }
   local n=$(( cols * rows ))
-  (( n == 1 )) || subtype=1   # grids must use substreams
 
   # Per-position stream URL; tiles outside the grid are ignored. Tiles whose NVR is unreachable
   # right now render black this cycle instead of stalling the graph; DEGRADED makes the caller
   # time-limit mpv so those tiles retry automatically.
   DEGRADED=0
   local url=()
-  local i pos ip port user pass ch fields
+  local i pos ip port user pass ch tsub fields
   for (( i=0; i<ntiles; i++ )); do
     # tr strips CRs so CRLF from any jq/file source can't corrupt the fields
-    readarray -t fields < <(jq -r ".tiles[$i] | .pos, .ip, .port, .user, .pass, .channel" "$CONFIG" | tr -d '\r')
+    readarray -t fields < <(jq -r ".tiles[$i] | .pos, .ip, .port, .user, .pass, .channel, (.subtype // \"\")" "$CONFIG" | tr -d '\r')
     pos=${fields[0]}; ip=${fields[1]}; port=${fields[2]}
-    user=${fields[3]}; pass=${fields[4]}; ch=${fields[5]}
+    user=${fields[3]}; pass=${fields[4]}; ch=${fields[5]}; tsub=${fields[6]}
+    [[ $tsub =~ ^[01]$ ]] || tsub=$subtype
     [[ $pos =~ ^[0-9]+$ ]] && (( pos < n )) || continue
     if [[ -z $ip || $ip == null || -z $user || $user == null || -z $pass || $pass == null ]]; then
       say "tile $pos is missing ip/user/pass"; return 1
@@ -101,7 +103,7 @@ run_once() {
       DEGRADED=1
       continue
     fi
-    url[$pos]="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor?channel=${ch}&subtype=${subtype}"
+    url[$pos]="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor?channel=${ch}&subtype=${tsub}"
   done
 
   local have=0

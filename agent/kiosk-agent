@@ -22,7 +22,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="1.7"
+AGENT_VERSION="1.8"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
