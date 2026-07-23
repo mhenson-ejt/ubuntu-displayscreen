@@ -1,10 +1,12 @@
 # Manual install (managed mode, no installer script)
 
-Every step `kiosk-setup.sh` performs, by hand. Useful for understanding the
-system or debugging a broken install. Assumptions: fresh Ubuntu Server 24.04,
-kiosk user **`viewer`** (substitute yours throughout), the repo's `agent/`
-folder copied to the box at `/tmp/agent/`, and the **manager URL** +
-**enrollment token** from the manager's Settings page.
+The essential steps `kiosk-setup.sh` performs, by hand — the script wraps
+these in logging, apt hardening and upgrade handling that an interactive
+human doesn't need. Useful for understanding the system or debugging a broken
+install. Assumptions: fresh Ubuntu Server 24.04, kiosk user **`viewer`**
+(substitute yours throughout), the repo's `agent/` folder copied to the box at
+`/tmp/agent/`, and the **manager URL** + **enrollment token** from the
+manager's Settings page.
 
 ## 1. Kiosk user and packages
 
@@ -63,7 +65,9 @@ EOF
 sudo chmod 600 /etc/kiosk/agent.env
 ```
 
-The agent appends `API_TOKEN=` and `SCREEN_ID=` after registering.
+The agent appends `API_TOKEN=` and `SCREEN_ID=` after registering. Optionally
+add `SCRIPT_BASE_URL=` if remote agent updates should pull from somewhere
+other than this repo's main branch on GitHub (the default).
 
 ## 7. Sudoers rule for instant sync
 
@@ -163,6 +167,10 @@ sudo systemctl restart kiosk-agent kiosk-display
 "needs configuration"; configure layout/NVR there and video starts a few
 seconds after saving. If a fleet WiFi network is set in the manager, the first
 config sync also logs `kiosk-apply-wifi: WiFi configured for "..."`.
+
+The display loop logs separately (via syslog, because X swallows its stderr):
+`journalctl -t kiosk-cams -f` shows player starts/exits and any tiles blacked
+out because their NVR is unreachable.
 
 Optional hardware decode check:
 `LIBVA_DRIVER_NAME=i965 vainfo --display drm --device /dev/dri/renderD128 | grep VAProfileH264`
