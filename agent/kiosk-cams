@@ -10,9 +10,12 @@
 # wall whenever any one input stalled:
 #   - a dropped connection makes that tile's mpv exit (network-timeout) and
 #     its loop respawns it in ~2s; the rest of the wall never blinks
-#   - a stream whose TCP session stays up but whose picture stops moving is
-#     caught by the freeze watchdog (mpv's time-pos stops advancing) and that
-#     one tile is killed + respawned
+#   - a player that is running but not making progress - frozen picture, OR a
+#     black window with no clock at all (wedged decoder, stalled handshake) -
+#     is caught by the watchdog and that one tile is killed + respawned; a
+#     dead respawn loop is itself respawned. The invariant is "every tile's
+#     playback clock advances or that tile gets restarted", so no tile can
+#     stay black without something acting on it
 #   - corrupt frames are dropped at the decoder instead of rendered, so a
 #     glitch is a blink on one tile, not a white/grey smear that persists
 #     until the next keyframe
@@ -119,9 +122,11 @@ PY
 }
 
 # mpv flags shared by every tile:
-#   discardcorrupt + err_detect: drop damaged frames at the demuxer AND the
-#     decoder instead of rendering them - a glitch is a blink on that tile,
-#     not a white smear that persists until the next keyframe.
+#   discardcorrupt + err_detect: drop damaged packets at the demuxer and flag
+#     decode errors, so glitches lean towards a blink instead of a white smear.
+#     Deliberately NOT err_detect +explode: that turned decode errors fatal,
+#     leaving mpv alive with a black window and no clock - a permanently black
+#     tile the first watchdog didn't recognise as sick.
 #   network-timeout: a dead TCP connection (NVR gone, or the default route
 #     moved to another interface, e.g. wired -> WiFi failover) makes mpv exit
 #     within ~15s so the tile loop reconnects over the live path.
@@ -134,7 +139,7 @@ COMMON_FLAGS=(--no-osc --no-input-default-bindings --no-border --no-keepaspect
               --msg-level=all=error
               --hwdec=auto --rtsp-transport=tcp --network-timeout=15
               --demuxer-lavf-o-add=fflags=+discardcorrupt
-              --vd-lavc-o-add=err_detect=+crccheck+bitstream+buffer+explode
+              --vd-lavc-o-add=err_detect=+crccheck+bitstream+buffer
               --cache=yes --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
 
 # One tile's respawn loop: probe, play, repeat. Runs in the background; the
@@ -152,21 +157,39 @@ tile_loop() { # tile_loop POS URL IP PORT GEOMETRY
     mpv "${COMMON_FLAGS[@]}" --geometry="$geometry" --input-ipc-server="$sock" "$url" &
     echo $! > "$pidfile"
     wait $!
+    rm -f "$pidfile"    # no pidfile between spawns - the watchdog must never kill a stale pid
     say "tile $pos: player exited - respawning"
     sleep 2
   done
 }
 
-TILE_LOOP_PID=()   # pos -> background tile_loop pid, set by build_wall
+# pos-indexed wall state, set by build_wall; kept global so the supervisor can
+# respawn a tile loop that has died
+TILE_LOOP_PID=()
+TILE_URL=()
+TILE_IP=()
+TILE_PORT=()
+TILE_GEOM=()
+
+# Prints the tile's mpv pid only if that pid is alive and really is mpv
+# (guards against pid reuse should a pidfile ever go stale).
+tile_mpv_pid() { # tile_mpv_pid POS
+  local pid
+  pid=$(cat "$RUN_DIR/kiosk-tile-$1.pid" 2>/dev/null)
+  [[ -n $pid && -r /proc/$pid/comm && $(cat "/proc/$pid/comm" 2>/dev/null) == mpv ]] && echo "$pid"
+}
 
 stop_tiles() {
-  local pos
+  local pos pid
   for pos in "${!TILE_LOOP_PID[@]}"; do
     kill "${TILE_LOOP_PID[$pos]}" 2>/dev/null
-    kill "$(cat "$RUN_DIR/kiosk-tile-$pos.pid" 2>/dev/null)" 2>/dev/null
+    pid=$(tile_mpv_pid "$pos")
+    [[ -n $pid ]] && kill "$pid" 2>/dev/null
     rm -f "$RUN_DIR/kiosk-tile-$pos.pid" "$RUN_DIR/kiosk-tile-$pos.sock"
   done
-  TILE_LOOP_PID=()
+  # catch any player that was mid-spawn when its loop died (pidfile not yet written)
+  pkill -x mpv 2>/dev/null
+  TILE_LOOP_PID=(); TILE_URL=(); TILE_IP=(); TILE_PORT=(); TILE_GEOM=()
 }
 
 # Parses the config and starts one tile_loop per usable tile.
@@ -234,6 +257,8 @@ build_wall() {
       printf ' %s' "${COMMON_FLAGS[@]}" "--geometry=$geometry" "${url[$pos]}"
       printf '\n'
     else
+      TILE_URL[$pos]=${url[$pos]}; TILE_IP[$pos]=${tip[$pos]}
+      TILE_PORT[$pos]=${tport[$pos]}; TILE_GEOM[$pos]=$geometry
       tile_loop "$pos" "${url[$pos]}" "${tip[$pos]}" "${tport[$pos]}" "$geometry" &
       TILE_LOOP_PID[$pos]=$!
     fi
@@ -241,13 +266,17 @@ build_wall() {
   return 0
 }
 
-# Watches the running wall: rebuilds on config change, restarts any tile whose
-# playback clock has stopped (stream up but picture frozen). Returns when the
-# wall needs rebuilding.
+# Watches the running wall and enforces one invariant per tile: its loop is
+# alive and, whenever its player is running, the playback clock is ADVANCING.
+# A running player with a frozen clock - frozen picture - or with no clock at
+# all - black window, decoder wedged, stalled handshake - is restarted after
+# FREEZE_SECS either way. A tile whose loop has died is respawned. No player
+# running is fine (the loop is between spawns or probing an unreachable NVR).
+# Returns when the config file changes so the caller rebuilds the wall.
 supervise() {
   local cfg_sig
   cfg_sig=$(md5sum "$CONFIG" 2>/dev/null)
-  local -A last stuck
+  local -A last stale
   local have_python=1
   command -v python3 >/dev/null || { have_python=0; say "python3 not found - freeze watchdog disabled (config reload still works)"; }
 
@@ -259,22 +288,34 @@ supervise() {
       return 0
     fi
 
-    (( have_python )) || continue
-    local pos v
+    local pos pid v
     for pos in "${!TILE_LOOP_PID[@]}"; do
+      if ! kill -0 "${TILE_LOOP_PID[$pos]}" 2>/dev/null; then
+        say "tile $pos: respawn loop died - restarting it"
+        tile_loop "$pos" "${TILE_URL[$pos]}" "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}" "${TILE_GEOM[$pos]}" &
+        TILE_LOOP_PID[$pos]=$!
+        last[$pos]=""; stale[$pos]=0
+        continue
+      fi
+
+      (( have_python )) || continue
+      pid=$(tile_mpv_pid "$pos")
+      if [[ -z $pid ]]; then
+        # loop is between spawns / waiting for the NVR - it handles itself
+        last[$pos]=""; stale[$pos]=0
+        continue
+      fi
+
       v=$(timepos "$RUN_DIR/kiosk-tile-$pos.sock")
-      if [[ -z $v ]]; then
-        # connecting or just restarted - network-timeout bounds that state
-        last[$pos]=""; stuck[$pos]=0
-      elif [[ $v == "${last[$pos]:-}" ]]; then
-        stuck[$pos]=$(( ${stuck[$pos]:-0} + WATCH_INTERVAL ))
-        if (( stuck[$pos] >= FREEZE_SECS )); then
-          say "tile $pos: picture frozen for ${stuck[$pos]}s - restarting that camera's player"
-          kill "$(cat "$RUN_DIR/kiosk-tile-$pos.pid" 2>/dev/null)" 2>/dev/null
-          last[$pos]=""; stuck[$pos]=0
-        fi
+      if [[ -n $v && $v != "${last[$pos]:-}" ]]; then
+        last[$pos]=$v; stale[$pos]=0
       else
-        last[$pos]=$v; stuck[$pos]=0
+        stale[$pos]=$(( ${stale[$pos]:-0} + WATCH_INTERVAL ))
+        if (( stale[$pos] >= FREEZE_SECS )); then
+          say "tile $pos: player alive but not progressing for ${stale[$pos]}s (${v:-no clock}) - restarting that camera"
+          kill "$pid" 2>/dev/null
+          last[$pos]=""; stale[$pos]=0
+        fi
       fi
     done
   done
