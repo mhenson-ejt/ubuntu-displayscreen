@@ -2,15 +2,28 @@
 #===============================================================================
 # kiosk-cams - the display loop, installed as /etc/kiosk/cams.sh.
 #
-# Runs inside the X session started by kiosk-display.service. Every iteration
-# it re-reads /etc/kiosk/config.json, applies rotation, rebuilds the mpv
-# command and runs it. A config change therefore only needs mpv killed (the
-# agent does `pkill mpv`) - the new settings are live in a few seconds with
-# no X restart and no black flash.
+# Runs inside the X session started by kiosk-display.service. Reads
+# /etc/kiosk/config.json, applies rotation and starts ONE mpv per tile, each a
+# borderless window covering its grid cell (empty cells are just the black X
+# root). Per-tile players exist so a sick camera only ever disturbs its own
+# cell - the previous single-mpv filter graph (hstack/vstack) froze the WHOLE
+# wall whenever any one input stalled:
+#   - a dropped connection makes that tile's mpv exit (network-timeout) and
+#     its loop respawns it in ~2s; the rest of the wall never blinks
+#   - a stream whose TCP session stays up but whose picture stops moving is
+#     caught by the freeze watchdog (mpv's time-pos stops advancing) and that
+#     one tile is killed + respawned
+#   - corrupt frames are dropped at the decoder instead of rendered, so a
+#     glitch is a blink on one tile, not a white/grey smear that persists
+#     until the next keyframe
+#
+# A config change still only needs mpv killed (the agent does `pkill mpv`);
+# the supervisor also polls the config file and rebuilds the wall within a few
+# seconds of it changing.
 #
 # Config shape (grid up to 6x6; tiles may come from different NVRs; grid
-# positions without a tile render black; every cell is scaled to a uniform
-# size so mixed camera resolutions are fine):
+# positions without a tile stay black; every cell is scaled to fill, so mixed
+# camera resolutions are fine):
 #   { "gridCols": 3, "gridRows": 2, "subtype": 1,
 #     "rotate": "none", "rotateOutput": null,
 #     "tiles": [ {"pos": 0, "ip": "..", "port": 554,
@@ -22,14 +35,15 @@
 # (used by tests; no X or mpv needed).
 #===============================================================================
 CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
-CELL_W=640
-CELL_H=360
+WATCH_INTERVAL=5   # supervisor poll cadence (config changes + freeze checks)
+FREEZE_SECS=30     # frozen this long -> restart that tile's player
+RUN_DIR=${KIOSK_RUN_DIR:-/tmp}
 
 # logger, not stderr: startx swallows the X clients' stderr, so journald never saw these
 say() { logger -t kiosk-cams -- "$*" 2>/dev/null; echo "kiosk-cams: $*" >&2; }
 
-# TCP probe so an unreachable NVR degrades to black cells instead of stalling the whole
-# filter graph (one input with no frames freezes hstack/vstack - the entire wall)
+# TCP probe so an unreachable NVR shows a black cell that keeps retrying,
+# instead of mpv burning a connect timeout every couple of seconds
 reachable() { # reachable IP PORT
   timeout 3 bash -c "echo > /dev/tcp/$1/$2" 2>/dev/null
 }
@@ -39,6 +53,7 @@ if [[ -z ${KIOSK_DRYRUN:-} ]]; then
   xset s off
   xset -dpms
   xset s noblank
+  xsetroot -solid black 2>/dev/null
 fi
 
 urlencode() {
@@ -63,9 +78,100 @@ apply_rotation() { # apply_rotation none|left|right OUTPUT-or-empty
   fi
 }
 
-# Builds and runs one mpv session from the current config.
+screen_size() { # echoes "W H" for the (already rotated) screen
+  if [[ -n ${KIOSK_DRYRUN:-} ]]; then echo "1920 1080"; return; fi
+  local dims
+  dims=$(xrandr 2>/dev/null | awk '/current/{sub(",", "", $10); print $8, $10; exit}')
+  [[ $dims =~ ^[0-9]+\ [0-9]+$ ]] && echo "$dims" || echo "1920 1080"
+}
+
+# Asks one tile's mpv for its playback clock over the JSON IPC socket. Prints
+# the value, or nothing if the player is still connecting / just restarted.
+timepos() { # timepos SOCKET
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+try:
+    s.connect(sys.argv[1])
+    s.sendall(b'{"command":["get_property","time-pos"],"request_id":7}\n')
+    buf = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+        for line in buf.split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if obj.get("request_id") == 7:
+                d = obj.get("data")
+                if isinstance(d, (int, float)):
+                    print(d)
+                sys.exit(0)
+except OSError:
+    pass
+PY
+}
+
+# mpv flags shared by every tile:
+#   discardcorrupt + err_detect: drop damaged frames at the demuxer AND the
+#     decoder instead of rendering them - a glitch is a blink on that tile,
+#     not a white smear that persists until the next keyframe.
+#   network-timeout: a dead TCP connection (NVR gone, or the default route
+#     moved to another interface, e.g. wired -> WiFi failover) makes mpv exit
+#     within ~15s so the tile loop reconnects over the live path.
+#   force-window=immediate: the cell goes up black right away instead of the
+#     root showing through while the RTSP handshake runs.
+#   msg-level (not really-quiet): real errors reach the journal so a sick
+#     stream is diagnosable.
+COMMON_FLAGS=(--no-osc --no-input-default-bindings --no-border --no-keepaspect
+              --force-window=immediate
+              --msg-level=all=error
+              --hwdec=auto --rtsp-transport=tcp --network-timeout=15
+              --demuxer-lavf-o-add=fflags=+discardcorrupt
+              --vd-lavc-o-add=err_detect=+crccheck+bitstream+buffer+explode
+              --cache=yes --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
+
+# One tile's respawn loop: probe, play, repeat. Runs in the background; the
+# supervisor kills the mpv pid (from the pidfile) to force a single-tile
+# restart, or kills this loop + the pid to tear the wall down.
+tile_loop() { # tile_loop POS URL IP PORT GEOMETRY
+  local pos=$1 url=$2 ip=$3 port=$4 geometry=$5
+  local sock=$RUN_DIR/kiosk-tile-$pos.sock pidfile=$RUN_DIR/kiosk-tile-$pos.pid
+  while true; do
+    if ! reachable "$ip" "$port"; then
+      say "tile $pos: NVR $ip:$port unreachable - black cell, retrying in 15s"
+      sleep 15
+      continue
+    fi
+    mpv "${COMMON_FLAGS[@]}" --geometry="$geometry" --input-ipc-server="$sock" "$url" &
+    echo $! > "$pidfile"
+    wait $!
+    say "tile $pos: player exited - respawning"
+    sleep 2
+  done
+}
+
+TILE_LOOP_PID=()   # pos -> background tile_loop pid, set by build_wall
+
+stop_tiles() {
+  local pos
+  for pos in "${!TILE_LOOP_PID[@]}"; do
+    kill "${TILE_LOOP_PID[$pos]}" 2>/dev/null
+    kill "$(cat "$RUN_DIR/kiosk-tile-$pos.pid" 2>/dev/null)" 2>/dev/null
+    rm -f "$RUN_DIR/kiosk-tile-$pos.pid" "$RUN_DIR/kiosk-tile-$pos.sock"
+  done
+  TILE_LOOP_PID=()
+}
+
+# Parses the config and starts one tile_loop per usable tile.
 # Returns 1 if the config is missing/unusable (caller waits and retries).
-run_once() {
+build_wall() {
   [[ -r $CONFIG ]] || { say "waiting for $CONFIG"; return 1; }
   jq -e . "$CONFIG" >/dev/null 2>&1 || { say "config is not valid JSON"; return 1; }
 
@@ -81,11 +187,10 @@ run_once() {
   [[ $ntiles =~ ^[0-9]+$ ]] && (( ntiles >= 1 )) || { say "no tiles configured"; return 1; }
   local n=$(( cols * rows ))
 
-  # Per-position stream URL; tiles outside the grid are ignored. Tiles whose NVR is unreachable
-  # right now render black this cycle instead of stalling the graph; DEGRADED makes the caller
-  # time-limit mpv so those tiles retry automatically.
-  DEGRADED=0
-  local url=()
+  # Per-position stream URL + NVR endpoint; tiles outside the grid or with
+  # broken fields are skipped (that cell stays black) rather than holding the
+  # rest of the wall hostage.
+  local url=() tip=() tport=()
   local i pos ip port user pass ch tsub fields
   for (( i=0; i<ntiles; i++ )); do
     # tr strips CRs so CRLF from any jq/file source can't corrupt the fields
@@ -95,108 +200,98 @@ run_once() {
     [[ $tsub =~ ^[01]$ ]] || tsub=$subtype
     [[ $pos =~ ^[0-9]+$ ]] && (( pos < n )) || continue
     if [[ -z $ip || $ip == null || -z $user || $user == null || -z $pass || $pass == null ]]; then
-      say "tile $pos is missing ip/user/pass"; return 1
+      say "tile $pos is missing ip/user/pass - leaving that cell black"; continue
     fi
-    [[ $ch =~ ^[0-9]+$ ]] && (( ch >= 1 )) || { say "tile $pos has an invalid channel"; return 1; }
-    if [[ -z ${KIOSK_DRYRUN:-} ]] && ! reachable "$ip" "$port"; then
-      say "tile $pos: NVR $ip:$port unreachable - showing black, retrying periodically"
-      DEGRADED=1
-      continue
-    fi
+    [[ $ch =~ ^[0-9]+$ ]] && (( ch >= 1 )) || { say "tile $pos has an invalid channel - leaving that cell black"; continue; }
+    [[ $port =~ ^[0-9]+$ ]] || port=554
     url[$pos]="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor?channel=${ch}&subtype=${tsub}"
+    tip[$pos]=$ip; tport[$pos]=$port
   done
 
   local have=0
   for (( pos=0; pos<n; pos++ )); do [[ -n ${url[$pos]:-} ]] && have=1; done
-  (( have )) || { say "no tiles inside the ${cols}x${rows} grid"; return 1; }
+  (( have )) || { say "no usable tiles inside the ${cols}x${rows} grid"; return 1; }
 
   apply_rotation "$rotate" "$rout"
 
-  # discardcorrupt: drop truncated frames instead of rendering them - a bad
-  # frame is a brief freeze on that tile, not a white smear that persists
-  # until the next keyframe. A small demuxer cache (instead of the previous
-  # low-latency profile) absorbs network/CPU hiccups; ~1s extra latency is
-  # invisible on a wall display.
-  # network-timeout: a dead TCP connection (NVR gone, or the default route moved to another
-  # interface, e.g. wired -> WiFi failover) makes mpv exit within ~15s so the respawn loop
-  # reconnects over the live path, instead of freezing on the last frame forever.
-  # msg-level (not really-quiet): real errors reach the journal so a sick stream is diagnosable.
-  local common=(--fs --no-osc --no-input-default-bindings --no-keepaspect
-                --msg-level=all=error
-                --hwdec=auto --rtsp-transport=tcp --network-timeout=15
-                --demuxer-lavf-o-add=fflags=+discardcorrupt
-                --cache=yes --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
-  local args=("${common[@]}")
+  local sw sh
+  read -r sw sh < <(screen_size)
+  local cell_w=$(( sw / cols )) cell_h=$(( sh / rows ))
 
-  if (( n == 1 )); then
-    args+=("${url[0]}")
-  else
-    # First camera position becomes mpv's main file (vid1); the rest are
-    # external files, numbered vid2.. in the order they are added.
-    local main=-1
-    for (( pos=0; pos<n; pos++ )); do
-      [[ -n ${url[$pos]:-} ]] && { main=$pos; break; }
-    done
-    local vid=() externals=() next=2
-    vid[$main]=1
-    for (( pos=0; pos<n; pos++ )); do
-      [[ -n ${url[$pos]:-} ]] || continue
-      (( pos == main )) && continue
-      vid[$pos]=$next
-      externals+=("--external-file=${url[$pos]}")
-      next=$(( next + 1 ))
-    done
+  local r c x y w h geometry
+  for (( pos=0; pos<n; pos++ )); do
+    [[ -n ${url[$pos]:-} ]] || continue
+    r=$(( pos / cols )); c=$(( pos % cols ))
+    x=$(( c * cell_w )); y=$(( r * cell_h ))
+    # last row/column absorbs the integer-division remainder so the wall
+    # reaches the screen edges exactly
+    w=$cell_w; h=$cell_h
+    (( c == cols - 1 )) && w=$(( sw - x ))
+    (( r == rows - 1 )) && h=$(( sh - y ))
+    geometry="${w}x${h}+${x}+${y}"
+    if [[ -n ${KIOSK_DRYRUN:-} ]]; then
+      printf 'MPV tile%s' "$pos"
+      printf ' %s' "${COMMON_FLAGS[@]}" "--geometry=$geometry" "${url[$pos]}"
+      printf '\n'
+    else
+      tile_loop "$pos" "${url[$pos]}" "${tip[$pos]}" "${tport[$pos]}" "$geometry" &
+      TILE_LOOP_PID[$pos]=$!
+    fi
+  done
+  return 0
+}
 
-    # Filter graph: every cell scaled to a uniform size (mixed camera
-    # resolutions stack fine), empty cells filled with black.
-    local graph="" r c
-    for (( pos=0; pos<n; pos++ )); do
-      if [[ -n ${url[$pos]:-} ]]; then
-        graph+="[vid${vid[$pos]}]scale=${CELL_W}:${CELL_H}[t${pos}];"
+# Watches the running wall: rebuilds on config change, restarts any tile whose
+# playback clock has stopped (stream up but picture frozen). Returns when the
+# wall needs rebuilding.
+supervise() {
+  local cfg_sig
+  cfg_sig=$(md5sum "$CONFIG" 2>/dev/null)
+  local -A last stuck
+  local have_python=1
+  command -v python3 >/dev/null || { have_python=0; say "python3 not found - freeze watchdog disabled (config reload still works)"; }
+
+  while true; do
+    sleep "$WATCH_INTERVAL"
+
+    if [[ $(md5sum "$CONFIG" 2>/dev/null) != "$cfg_sig" ]]; then
+      say "config changed - rebuilding the wall"
+      return 0
+    fi
+
+    (( have_python )) || continue
+    local pos v
+    for pos in "${!TILE_LOOP_PID[@]}"; do
+      v=$(timepos "$RUN_DIR/kiosk-tile-$pos.sock")
+      if [[ -z $v ]]; then
+        # connecting or just restarted - network-timeout bounds that state
+        last[$pos]=""; stuck[$pos]=0
+      elif [[ $v == "${last[$pos]:-}" ]]; then
+        stuck[$pos]=$(( ${stuck[$pos]:-0} + WATCH_INTERVAL ))
+        if (( stuck[$pos] >= FREEZE_SECS )); then
+          say "tile $pos: picture frozen for ${stuck[$pos]}s - restarting that camera's player"
+          kill "$(cat "$RUN_DIR/kiosk-tile-$pos.pid" 2>/dev/null)" 2>/dev/null
+          last[$pos]=""; stuck[$pos]=0
+        fi
       else
-        graph+="color=c=black:s=${CELL_W}x${CELL_H}:r=10[t${pos}];"
+        last[$pos]=$v; stuck[$pos]=0
       fi
     done
-    if (( rows == 1 )); then
-      for (( c=0; c<cols; c++ )); do graph+="[t${c}]"; done
-      graph+="hstack=inputs=${cols}[vo]"
-    elif (( cols == 1 )); then
-      for (( r=0; r<rows; r++ )); do graph+="[t${r}]"; done
-      graph+="vstack=inputs=${rows}[vo]"
-    else
-      for (( r=0; r<rows; r++ )); do
-        for (( c=0; c<cols; c++ )); do graph+="[t$(( r * cols + c ))]"; done
-        graph+="hstack=inputs=${cols}[row${r}];"
-      done
-      for (( r=0; r<rows; r++ )); do graph+="[row${r}]"; done
-      graph+="vstack=inputs=${rows}[vo]"
-    fi
-    args+=("--lavfi-complex=${graph}" "${externals[@]}" "${url[$main]}")
-  fi
-
-  if [[ -n ${KIOSK_DRYRUN:-} ]]; then
-    printf 'MPV %s\n' "${args[@]}"
-    return 0
-  fi
-  if (( DEGRADED )); then
-    # some tiles are blacked out - time-limit this session so they retry every 5 minutes
-    # (a respawn is a ~3s flash; only happens while degraded)
-    timeout 300 mpv "${args[@]}"
-  else
-    mpv "${args[@]}"
-  fi
+  done
 }
 
 if [[ -n ${KIOSK_DRYRUN:-} ]]; then
-  run_once
+  build_wall
   exit $?
 fi
 
+trap stop_tiles EXIT
+
 while true; do
-  say "starting player"
-  if run_once; then
-    say "player exited (stream drop or config reload) - respawning"
-    sleep 3
+  if build_wall; then
+    say "wall up (${#TILE_LOOP_PID[@]} tile player(s))"
+    supervise
+    stop_tiles
   else
     sleep 5    # config missing/invalid - wait for the agent to fix it (reason already logged)
   fi

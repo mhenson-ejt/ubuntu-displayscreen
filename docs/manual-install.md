@@ -15,7 +15,7 @@ sudo adduser viewer
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   xorg xinit x11-xserver-utils xserver-xorg-legacy mpv i965-va-driver vainfo \
-  openssh-server curl ca-certificates jq wpasupplicant iw
+  openssh-server curl ca-certificates jq wpasupplicant iw python3
 sudo usermod -aG render,video viewer
 ```
 
