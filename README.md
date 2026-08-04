@@ -12,6 +12,11 @@ Two ways to run it:
   values from the manager's Settings page.
 - **Standalone** — everything is configured on the box itself at install time.
 
+Architecture, the per-tile player/watchdog design, the agent protocol, WiFi
+handling and troubleshooting are all covered in detail in
+**[docs/how-it-works.md](docs/how-it-works.md)**; manual install steps in
+[docs/manual-install.md](docs/manual-install.md).
+
 ## Install
 
 Create the kiosk user first if it doesn't exist (`sudo adduser viewer`), then:

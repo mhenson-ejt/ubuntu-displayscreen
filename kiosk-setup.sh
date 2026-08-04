@@ -37,7 +37,7 @@
 #   NVR_PASS    - NVR password (special characters are auto URL-encoded)
 #   LAYOUT      - 1 | 2h | 2v | 4  (single / 2 side-by-side / 2 stacked / 2x2)
 #   CHANNELS    - space-separated NVR channel numbers, e.g. "1 2 3 4"
-#   SUBTYPE     - 0 main stream, 1 substream (default: 1; forced 1 for grids)
+#   SUBTYPE     - 0 main stream, 1 substream (default: 1)
 #   ROTATE      - none | left | right  (monitor rotation, default: none)
 #   ROTATE_OUT  - X output name for rotation, e.g. HDMI-1 (auto-detected)
 #   SSH_KEYS_URL- URL of a public-key list refreshed hourly
@@ -154,8 +154,7 @@ if [[ $MODE == standalone ]]; then
 
   SUBTYPE=${SUBTYPE:-1}
   if [[ $LAYOUT != 1 && $SUBTYPE != 1 ]]; then
-    warn "Grid layouts should use substreams; forcing SUBTYPE=1."
-    SUBTYPE=1
+    warn "Grid layout with main streams: much heavier decode load - substreams (SUBTYPE=1) are usually the right choice."
   fi
 
   ROTATE=${ROTATE:-}
