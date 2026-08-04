@@ -286,6 +286,15 @@ elif [[ -f /etc/kiosk/config.json ]]; then
   fi
 fi
 
+# WiFi power saving causes periodic latency spikes and micro-disconnects that
+# stall long-lived RTSP streams - the "WiFi screen keeps dropping tiles, wired
+# screen is fine" pattern. Turn it off at every boot; no-op on wired-only boxes.
+log "Installing WiFi power-save disable service..."
+fetch_file agent/kiosk-wifi-powersave.service /etc/systemd/system/kiosk-wifi-powersave.service 644
+systemctl daemon-reload
+systemctl enable kiosk-wifi-powersave 2>/dev/null || true
+systemctl restart kiosk-wifi-powersave 2>/dev/null || true
+
 #--- SSH key updater (both modes) ----------------------------------------------
 # Managed mode: the agent calls it with a key file fetched from the manager.
 # Standalone mode: an hourly timer calls it with no args -> fetches from URL.
