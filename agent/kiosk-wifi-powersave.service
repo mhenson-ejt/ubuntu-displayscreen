@@ -3,15 +3,19 @@ Description=Disable WiFi power saving (kiosk RTSP streams)
 # WiFi power management trades latency for battery on laptops; on a mains-powered
 # kiosk it just causes periodic latency spikes and micro-disconnects that stall
 # long-lived RTSP streams (black/frozen tiles on WiFi screens, wired unaffected).
-# After network-online so the wireless interface exists and is associated.
+#
+# NOT a oneshot: power_save resets to the driver default (on) whenever the
+# interface resets - which is exactly what happens on the flappy links this
+# exists to fix. Re-assert every 60s so no reset survives long.
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
+Restart=always
+RestartSec=5
 # every wireless interface; harmless no-op on wired-only screens
-ExecStart=/bin/sh -c 'for d in /sys/class/net/*/wireless; do [ -e "$d" ] || continue; i=${d%/wireless}; iw dev "${i##*/}" set power_save off || true; done'
+ExecStart=/bin/sh -c 'while :; do for d in /sys/class/net/*/wireless; do [ -e "$d" ] || continue; i=${d%/wireless}; iw dev "${i##*/}" set power_save off 2>/dev/null || true; done; sleep 60; done'
 
 [Install]
 WantedBy=multi-user.target
