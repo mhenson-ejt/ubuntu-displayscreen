@@ -8,14 +8,15 @@
 # root). Per-tile players exist so a sick camera only ever disturbs its own
 # cell - the previous single-mpv filter graph (hstack/vstack) froze the WHOLE
 # wall whenever any one input stalled:
-#   - a dropped connection makes that tile's mpv exit (network-timeout) and
-#     its loop respawns it in ~2s; the rest of the wall never blinks
-#   - a player that is running but not making progress - frozen picture, OR a
-#     black window with no clock at all (wedged decoder, stalled handshake) -
-#     is caught by the watchdog and that one tile is killed + respawned; a
-#     dead respawn loop is itself respawned. The invariant is "every tile's
-#     playback clock advances or that tile gets restarted", so no tile can
-#     stay black without something acting on it
+#   - a dropped connection does NOT tear the window down: keep-open holds the
+#     last frame and the supervisor reloads the stream in-place over IPC as
+#     soon as the NVR answers again, so an outage looks like a paused picture
+#     that resumes - never a black cell
+#   - a wedged player (clock stuck while data still arrives, or a black
+#     window that never starts) is killed + respawned - only that tile; a
+#     dead respawn loop is itself respawned. Network starvation is left to
+#     ride (mpv resumes by itself) with a long last-resort restart, because
+#     killing a buffering player just trades a frozen frame for a black cell
 #   - corrupt frames are dropped at the decoder instead of rendered, so a
 #     glitch is a blink on one tile, not a white/grey smear that persists
 #     until the next keyframe
@@ -38,8 +39,12 @@
 # (used by tests; no X or mpv needed).
 #===============================================================================
 CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
-WATCH_INTERVAL=5   # supervisor poll cadence (config changes + freeze checks)
-FREEZE_SECS=30     # frozen this long -> restart that tile's player
+WATCH_INTERVAL=5   # supervisor poll cadence (config changes + tile health)
+FREEZE_SECS=30     # hard failures (wedged decoder, black window): restart after this
+STARVE_SECS=180    # network starvation (last frame showing, mpv will resume by
+                   # itself when data returns): only restart as a last resort -
+                   # killing a starved player just turns a frozen frame into a
+                   # black cell and a reconnect over the same bad network
 RUN_DIR=${KIOSK_RUN_DIR:-/tmp}
 
 # logger, not stderr: startx swallows the X clients' stderr, so journald never saw these
@@ -88,34 +93,58 @@ screen_size() { # echoes "W H" for the (already rotated) screen
   [[ $dims =~ ^[0-9]+\ [0-9]+$ ]] && echo "$dims" || echo "1920 1080"
 }
 
-# Asks one tile's mpv for its playback clock over the JSON IPC socket. Prints
-# the value, or nothing if the player is still connecting / just restarted.
-timepos() { # timepos SOCKET
-  python3 - "$1" <<'PY' 2>/dev/null
+# Asks one tile's mpv for a set of properties over the JSON IPC socket in one
+# connection. Prints them space-separated in argument order; "-" for anything
+# unavailable (player connecting, property unsupported); booleans as 0/1.
+mpv_props() { # mpv_props SOCKET PROP...
+  python3 - "$@" <<'PY' 2>/dev/null
 import json, socket, sys
-s = socket.socket(socket.AF_UNIX)
-s.settimeout(2)
+sock, props = sys.argv[1], sys.argv[2:]
+out = ["-"] * len(props)
 try:
-    s.connect(sys.argv[1])
-    s.sendall(b'{"command":["get_property","time-pos"],"request_id":7}\n')
-    buf = b""
-    while True:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(2)
+    s.connect(sock)
+    for i, p in enumerate(props):
+        s.sendall(json.dumps({"command": ["get_property", p], "request_id": i}).encode() + b"\n")
+    buf, seen = b"", 0
+    while seen < len(props):
         chunk = s.recv(65536)
         if not chunk:
             break
         buf += chunk
-        for line in buf.split(b"\n"):
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
             if not line.strip():
                 continue
             try:
                 obj = json.loads(line)
             except ValueError:
                 continue
-            if obj.get("request_id") == 7:
+            rid = obj.get("request_id")
+            if isinstance(rid, int) and 0 <= rid < len(props):
+                seen += 1
                 d = obj.get("data")
-                if isinstance(d, (int, float)):
-                    print(d)
-                sys.exit(0)
+                if isinstance(d, bool):
+                    out[rid] = "1" if d else "0"
+                elif isinstance(d, (int, float)):
+                    out[rid] = repr(d)
+except OSError:
+    pass
+print(" ".join(out))
+PY
+}
+
+# Sends one command (e.g. loadfile) to a tile's mpv; fire-and-forget.
+mpv_cmd() { # mpv_cmd SOCKET CMD ARG...
+  python3 - "$@" <<'PY' 2>/dev/null
+import json, socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(2)
+    s.connect(sys.argv[1])
+    s.sendall(json.dumps({"command": sys.argv[2:]}).encode() + b"\n")
+    s.recv(4096)
 except OSError:
     pass
 PY
@@ -127,15 +156,18 @@ PY
 #     Deliberately NOT err_detect +explode: that turned decode errors fatal,
 #     leaving mpv alive with a black window and no clock - a permanently black
 #     tile the first watchdog didn't recognise as sick.
-#   network-timeout: a dead TCP connection (NVR gone, or the default route
-#     moved to another interface, e.g. wired -> WiFi failover) makes mpv exit
-#     within ~15s so the tile loop reconnects over the live path.
+#   keep-open + idle: when the stream dies (network-timeout after ~15s of a
+#     dead connection, NVR closing the session, ...), mpv does NOT exit - it
+#     holds the LAST FRAME on screen and waits. The supervisor reloads the
+#     stream in-place over IPC once the NVR answers again, so an outage shows
+#     as a paused picture that resumes, never a black cell + window teardown.
 #   force-window=immediate: the cell goes up black right away instead of the
 #     root showing through while the RTSP handshake runs.
 #   msg-level (not really-quiet): real errors reach the journal so a sick
 #     stream is diagnosable.
 COMMON_FLAGS=(--no-osc --no-input-default-bindings --no-border --no-keepaspect
               --force-window=immediate
+              --keep-open=yes --idle=yes
               --msg-level=all=error
               --hwdec=auto --rtsp-transport=tcp --network-timeout=15
               --demuxer-lavf-o-add=fflags=+discardcorrupt
@@ -159,7 +191,7 @@ tile_loop() { # tile_loop POS URL IP PORT GEOMETRY
     wait $!
     rm -f "$pidfile"    # no pidfile between spawns - the watchdog must never kill a stale pid
     say "tile $pos: player exited - respawning"
-    sleep 2
+    sleep $(( 2 + pos % 3 ))   # stagger so tiles don't all hammer the NVR/WiFi at once
   done
 }
 
@@ -266,19 +298,29 @@ build_wall() {
   return 0
 }
 
-# Watches the running wall and enforces one invariant per tile: its loop is
-# alive and, whenever its player is running, the playback clock is ADVANCING.
-# A running player with a frozen clock - frozen picture - or with no clock at
-# all - black window, decoder wedged, stalled handshake - is restarted after
-# FREEZE_SECS either way. A tile whose loop has died is respawned. No player
-# running is fine (the loop is between spawns or probing an unreachable NVR).
-# Returns when the config file changes so the caller rebuilds the wall.
+# Watches the running wall. Per tile the goal is "recover with the LEAST
+# visible disruption that actually helps", so failures are told apart rather
+# than treated with one hammer (v2.0 restarted any 30s stall, which on flaky
+# WiFi killed players that were mid-buffer and about to resume by themselves):
+#   - stream ended / connection died (mpv at EOF or idle, last frame or black
+#     held on screen): reload the stream IN-PLACE over IPC as soon as the NVR
+#     answers - the picture resumes without the window ever tearing down.
+#     Only if reloads get the player nowhere for STARVE_SECS is it restarted.
+#   - clock frozen while data still arrives: wedged decoder - restart that
+#     tile after FREEZE_SECS; nothing else can fix it.
+#   - clock frozen and NO data arriving: network starvation - mpv is showing
+#     the last frame and resumes on its own; leave it alone, restart only
+#     after STARVE_SECS as a last resort.
+#   - no clock at all for FREEZE_SECS (black window, never started): restart -
+#     there is no picture to preserve.
+# A tile whose loop died is respawned; no player running is fine (the loop is
+# between spawns or probing). Returns when the config file changes.
 supervise() {
   local cfg_sig
   cfg_sig=$(md5sum "$CONFIG" 2>/dev/null)
-  local -A last stale
+  local -A last_tp last_ct stall_tp stall_ct eof_stall retry nvr_ok
   local have_python=1
-  command -v python3 >/dev/null || { have_python=0; say "python3 not found - freeze watchdog disabled (config reload still works)"; }
+  command -v python3 >/dev/null || { have_python=0; say "python3 not found - tile watchdog disabled (config reload still works)"; }
 
   while true; do
     sleep "$WATCH_INTERVAL"
@@ -288,13 +330,14 @@ supervise() {
       return 0
     fi
 
-    local pos pid v
+    local pos pid sock tp ct eof idle reason key
+    nvr_ok=()   # NVR reachability, probed at most once per NVR per sweep
     for pos in "${!TILE_LOOP_PID[@]}"; do
       if ! kill -0 "${TILE_LOOP_PID[$pos]}" 2>/dev/null; then
         say "tile $pos: respawn loop died - restarting it"
         tile_loop "$pos" "${TILE_URL[$pos]}" "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}" "${TILE_GEOM[$pos]}" &
         TILE_LOOP_PID[$pos]=$!
-        last[$pos]=""; stale[$pos]=0
+        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0; eof_stall[$pos]=0; retry[$pos]=0
         continue
       fi
 
@@ -302,20 +345,73 @@ supervise() {
       pid=$(tile_mpv_pid "$pos")
       if [[ -z $pid ]]; then
         # loop is between spawns / waiting for the NVR - it handles itself
-        last[$pos]=""; stale[$pos]=0
+        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0; eof_stall[$pos]=0; retry[$pos]=0
         continue
       fi
 
-      v=$(timepos "$RUN_DIR/kiosk-tile-$pos.sock")
-      if [[ -n $v && $v != "${last[$pos]:-}" ]]; then
-        last[$pos]=$v; stale[$pos]=0
-      else
-        stale[$pos]=$(( ${stale[$pos]:-0} + WATCH_INTERVAL ))
-        if (( stale[$pos] >= FREEZE_SECS )); then
-          say "tile $pos: player alive but not progressing for ${stale[$pos]}s (${v:-no clock}) - restarting that camera"
-          kill "$pid" 2>/dev/null
-          last[$pos]=""; stale[$pos]=0
+      sock=$RUN_DIR/kiosk-tile-$pos.sock
+      read -r tp ct eof idle < <(mpv_props "$sock" time-pos demuxer-cache-time eof-reached idle-active)
+
+      if [[ $eof == 1 || $idle == 1 ]]; then
+        # stream over (keep-open holds the last frame; idle = load failed, black).
+        # Reload in-place once the NVR answers; the window never tears down.
+        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0
+        key="${TILE_IP[$pos]}:${TILE_PORT[$pos]}"
+        if [[ -z ${nvr_ok[$key]:-} ]]; then
+          if reachable "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}"; then nvr_ok[$key]=1; else nvr_ok[$key]=0; fi
         fi
+        if [[ ${nvr_ok[$key]} == 1 ]]; then
+          # the give-up clock only ticks while the NVR is answering: after a
+          # long outage the FIRST action is a seamless reload, not a restart
+          eof_stall[$pos]=$(( ${eof_stall[$pos]:-0} + WATCH_INTERVAL ))
+          if (( eof_stall[$pos] >= STARVE_SECS )); then
+            say "tile $pos: reloads got nowhere for ${eof_stall[$pos]}s - restarting that camera's player"
+            kill "$pid" 2>/dev/null
+            eof_stall[$pos]=0; retry[$pos]=0
+          else
+            retry[$pos]=$(( ${retry[$pos]:-0} - WATCH_INTERVAL ))
+            if (( retry[$pos] <= 0 )); then
+              say "tile $pos: stream ended - reloading in place (picture holds, no teardown)"
+              mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
+              retry[$pos]=15
+            fi
+          fi
+        else
+          # NVR unreachable - hold the last frame; nothing we do would help
+          eof_stall[$pos]=0; retry[$pos]=0
+        fi
+        continue
+      fi
+      eof_stall[$pos]=0; retry[$pos]=0
+
+      if [[ $tp != - && $tp != "${last_tp[$pos]:-}" ]]; then
+        last_tp[$pos]=$tp; stall_tp[$pos]=0
+      else
+        stall_tp[$pos]=$(( ${stall_tp[$pos]:-0} + WATCH_INTERVAL ))
+      fi
+      if [[ $ct != - && $ct != "${last_ct[$pos]:-}" ]]; then
+        last_ct[$pos]=$ct; stall_ct[$pos]=0
+      else
+        stall_ct[$pos]=$(( ${stall_ct[$pos]:-0} + WATCH_INTERVAL ))
+      fi
+      (( stall_tp[$pos] == 0 )) && continue
+
+      reason=""
+      if [[ ${last_tp[$pos]:-} == "" ]]; then
+        # never produced a clock - black window, nothing on screen to preserve
+        (( stall_tp[$pos] >= FREEZE_SECS )) && reason="no playback clock for ${stall_tp[$pos]}s (black window)"
+      elif (( stall_ct[$pos] < stall_tp[$pos] )); then
+        # data still arriving but the clock is stuck - wedged decoder
+        (( stall_tp[$pos] >= FREEZE_SECS )) && reason="clock stuck for ${stall_tp[$pos]}s while data still arrives (wedged player)"
+      else
+        # no data coming in - network starvation; mpv holds the last frame and
+        # resumes by itself, so only step in as a last resort
+        (( stall_tp[$pos] >= STARVE_SECS )) && reason="no stream data for ${stall_tp[$pos]}s"
+      fi
+      if [[ -n $reason ]]; then
+        say "tile $pos: $reason - restarting that camera's player"
+        kill "$pid" 2>/dev/null
+        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0
       fi
     done
   done
