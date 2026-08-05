@@ -104,18 +104,21 @@ sync (e.g. installed somewhere with no cable), set it once by hand:
 sudo kiosk-apply-wifi "YourSSID" "your-password"   # --clear to remove
 ```
 
-## 9. WiFi power-save enforcer
+## 9. WiFi watchdog
 
 ```bash
-sudo install -m 644 /tmp/agent/kiosk-wifi-powersave.service /etc/systemd/system/kiosk-wifi-powersave.service
+sudo install -m 755 /tmp/agent/kiosk-wifi-watchdog /usr/local/sbin/kiosk-wifi-watchdog
+sudo install -m 644 /tmp/agent/kiosk-wifi-watchdog.service /etc/systemd/system/kiosk-wifi-watchdog.service
 ```
 
-WiFi power management causes latency spikes and micro-disconnects that stall
-long-lived RTSP streams. The service re-asserts `power_save off` on every
-wireless interface every 60 s - deliberately not a run-once, because the
-setting reverts to the driver default whenever the interface resets (which is
-exactly what happens on a flaky link). Harmless no-op on wired-only screens.
-Enabled in step 11.
+Every 60 s it re-asserts `power_save off` on every wireless interface
+(power management causes the latency spikes that stall RTSP, and the setting
+reverts to the driver default whenever the interface resets), and - when the
+default route runs over WiFi - pings the gateway, escalating on sustained
+loss: interface bounce at 3 min, WiFi driver module reload at 6 min (the part
+of a reboot that actually fixes a degraded NIC), guarded reboot at 15 min
+(uptime > 30 min, at most one per 6 h). Harmless no-op on wired screens.
+Enabled in step 11; details in `how-it-works.md` §7.
 
 ## 10. SSH key updater
 
@@ -169,8 +172,8 @@ sudo chmod 755 /usr/local/sbin/kiosk-update-ssh-keys
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl disable getty@tty1.service
-sudo systemctl enable kiosk-agent kiosk-display kiosk-wifi-powersave
-sudo systemctl restart kiosk-agent kiosk-display kiosk-wifi-powersave
+sudo systemctl enable kiosk-agent kiosk-display kiosk-wifi-watchdog
+sudo systemctl restart kiosk-agent kiosk-display kiosk-wifi-watchdog
 ```
 
 ## 12. Verify
@@ -192,7 +195,8 @@ Optional hardware decode check:
 `LIBVA_DRIVER_NAME=i965 vainfo --display drm --device /dev/dri/renderD128 | grep VAProfileH264`
 
 WiFi screens: `iw dev <wlan-interface> get power_save` should say `off`
-(within 60 s of boot - see step 9).
+(within 60 s of boot), and `journalctl -u kiosk-wifi-watchdog` shows any
+link-recovery escalations (see step 9).
 
 Hardware reminders: BIOS "After Power Failure" = Power On; camera streams
 encoded as H.264 (the i965 VAAPI driver cannot hardware-decode H.265). Mixed

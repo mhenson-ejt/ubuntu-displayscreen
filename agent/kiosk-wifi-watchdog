@@ -1,0 +1,151 @@
+#!/bin/bash
+#===============================================================================
+# kiosk-wifi-watchdog - keeps the WiFi path usable on kiosk screens.
+#
+# WiFi on these boxes degrades in ways a 24/7 kiosk can't tolerate:
+#   - power_save re-enables itself whenever the interface resets, causing
+#     latency spikes and micro-disconnects that stall RTSP
+#   - driver/firmware stacks (notably Intel iwlwifi) degrade under hours of
+#     sustained streaming: throughput collapses gradually until nothing moves,
+#     and only re-initialising the hardware recovers it. A reboot "fixes" it
+#     precisely because a reboot reloads the driver - so do that directly, in
+#     escalating steps, without touching the rest of the box.
+#
+# Every 60s:
+#   1. re-assert power_save off on every wireless interface (~1ms, idempotent)
+#   2. if the default route runs over WiFi, ping the gateway. On sustained
+#      failure, escalate once per episode:
+#        >= 3 min   interface bounce (down/up -> fresh association + DHCP)
+#        >= 6 min   WiFi driver module reload (what a reboot does to the NIC)
+#        >= 15 min  reboot - guarded: uptime > 30 min AND at most one
+#                   watchdog reboot per 6 h (persistent stamp), so a dead AP
+#                   can never cause a reboot loop
+#      A screen whose default route is wired: health check is a no-op (the
+#      streams don't depend on WiFi), only power_save is asserted.
+#
+# Logs to the journal via the service's stdout (unit kiosk-wifi-watchdog).
+#===============================================================================
+set -u
+
+INTERVAL=60
+BOUNCE_AFTER=3      # minutes of consecutive gateway loss
+RELOAD_AFTER=6
+REBOOT_AFTER=15
+REBOOT_MIN_UPTIME=1800
+REBOOT_HOLDOFF=21600
+STAMP=${KIOSK_WW_STAMP:-/var/lib/kiosk-wifi-watchdog.last-reboot}
+
+FAIL=0; BOUNCED=0; RELOADED=0
+
+say() { echo "$*"; }
+
+wlan_if() { # first wireless interface, if any
+  local d
+  for d in /sys/class/net/*/wireless; do
+    [[ -e $d ]] || continue
+    d=${d%/wireless}; echo "${d##*/}"; return 0
+  done
+  return 1
+}
+
+powersave_off_all() {
+  local d i
+  for d in /sys/class/net/*/wireless; do
+    [[ -e $d ]] || continue
+    i=${d%/wireless}
+    iw dev "${i##*/}" set power_save off 2>/dev/null || true
+  done
+}
+
+wifi_gw() { # wifi_gw WLAN -> gateway ip IF the default route runs over WiFi
+  ip -o route show default 2>/dev/null | awk -v ifc="$1" '$0 ~ (" dev " ifc " ") || $0 ~ (" dev " ifc "$") {
+    for (n = 1; n < NF; n++) if ($n == "via") { print $(n+1); exit } }'
+}
+
+bounce_iface() {
+  say "bouncing $1 (down/up -> fresh association + DHCP)"
+  ip link set "$1" down 2>/dev/null
+  sleep 3
+  ip link set "$1" up 2>/dev/null
+  networkctl reconfigure "$1" 2>/dev/null || true
+}
+
+reload_driver() {
+  local mod
+  mod=$(basename "$(readlink -f "/sys/class/net/$1/device/driver/module" 2>/dev/null)" 2>/dev/null)
+  if [[ -z $mod || $mod == / || $mod == . ]]; then
+    say "cannot determine the driver module for $1 - skipping reload"
+    return
+  fi
+  say "reloading WiFi driver module '$mod' (the part of a reboot that actually fixes a degraded NIC)"
+  ip link set "$1" down 2>/dev/null
+  if ! modprobe -r "$mod" 2>/dev/null; then
+    say "modprobe -r $mod failed (module busy?) - will escalate if the link stays dead"
+    return
+  fi
+  sleep 2
+  modprobe "$mod" 2>/dev/null || say "modprobe $mod FAILED - interface will be gone until reboot"
+  sleep 5
+  # hand the (re-appeared) interface back to netplan's supplicant + networkd
+  systemctl restart "netplan-wpa-$1.service" 2>/dev/null \
+    || systemctl restart "wpa_supplicant@$1.service" 2>/dev/null || true
+  networkctl reconfigure "$1" 2>/dev/null || true
+}
+
+try_reboot() {
+  local up now last
+  up=$(awk '{print int($1)}' /proc/uptime)
+  if (( up < REBOOT_MIN_UPTIME )); then
+    say "WiFi dead ${FAIL} min but uptime < 30 min - holding off the reboot escalation"
+    return
+  fi
+  now=$(date +%s)
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  if (( now - last < REBOOT_HOLDOFF )); then
+    say "WiFi dead ${FAIL} min but already watchdog-rebooted within 6h - holding (AP-side problem?)"
+    return
+  fi
+  echo "$now" > "$STAMP" 2>/dev/null || true
+  say "WiFi dead for ${FAIL} min despite bounce + driver reload - rebooting as last resort"
+  sync
+  systemctl reboot
+}
+
+tick() {
+  powersave_off_all
+
+  local wlan gw
+  wlan=$(wlan_if) || return 0            # no WiFi hardware at all
+  gw=$(wifi_gw "$wlan")
+  if [[ -z $gw ]]; then                  # default route is wired (or no route yet)
+    FAIL=0; BOUNCED=0; RELOADED=0
+    return 0
+  fi
+
+  if ping -c 2 -W 2 "$gw" >/dev/null 2>&1; then
+    (( FAIL >= BOUNCE_AFTER )) && say "gateway $gw reachable again after ${FAIL} min - link recovered"
+    FAIL=0; BOUNCED=0; RELOADED=0
+    return 0
+  fi
+
+  FAIL=$(( FAIL + 1 ))
+  say "gateway $gw unreachable over $wlan (${FAIL} consecutive min)"
+  if (( FAIL >= REBOOT_AFTER )); then
+    try_reboot
+  elif (( FAIL >= RELOAD_AFTER && RELOADED == 0 )); then
+    reload_driver "$wlan"; RELOADED=1
+  elif (( FAIL >= BOUNCE_AFTER && BOUNCED == 0 )); then
+    bounce_iface "$wlan"; BOUNCED=1
+  fi
+  return 0
+}
+
+# tests source this file for the functions without entering the loop
+[[ -n ${KIOSK_WW_SOURCED:-} ]] && return 0
+
+say "kiosk-wifi-watchdog starting (power_save off + WiFi link escalation: bounce ${BOUNCE_AFTER}m / driver reload ${RELOAD_AFTER}m / guarded reboot ${REBOOT_AFTER}m)"
+while :; do
+  tick
+  sleep "$INTERVAL"
+done

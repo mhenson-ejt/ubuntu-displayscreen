@@ -285,14 +285,19 @@ elif [[ -f /etc/kiosk/config.json ]]; then
   fi
 fi
 
-# WiFi power saving causes periodic latency spikes and micro-disconnects that
-# stall long-lived RTSP streams - the "WiFi screen keeps dropping tiles, wired
-# screen is fine" pattern. Turn it off at every boot; no-op on wired-only boxes.
-log "Installing WiFi power-save disable service..."
-fetch_file agent/kiosk-wifi-powersave.service /etc/systemd/system/kiosk-wifi-powersave.service 644
+# WiFi husbandry: power_save off (it re-enables itself on interface resets and
+# causes the RTSP-stalling latency spikes), plus a link watchdog for WiFi
+# stacks that degrade over hours of streaming until only re-initialising the
+# hardware helps (bounce -> driver reload -> guarded reboot). No-op on wired.
+log "Installing WiFi watchdog..."
+fetch_file agent/kiosk-wifi-watchdog /usr/local/sbin/kiosk-wifi-watchdog 755
+fetch_file agent/kiosk-wifi-watchdog.service /etc/systemd/system/kiosk-wifi-watchdog.service 644
+# upgrade hygiene: absorbed the old power-save-only unit
+systemctl disable --now kiosk-wifi-powersave 2>/dev/null || true
+rm -f /etc/systemd/system/kiosk-wifi-powersave.service
 systemctl daemon-reload
-systemctl enable kiosk-wifi-powersave 2>/dev/null || true
-systemctl restart kiosk-wifi-powersave 2>/dev/null || true
+systemctl enable kiosk-wifi-watchdog 2>/dev/null || true
+systemctl restart kiosk-wifi-watchdog 2>/dev/null || true
 
 #--- SSH key updater (both modes) ----------------------------------------------
 # Managed mode: the agent calls it with a key file fetched from the manager.

@@ -1,0 +1,18 @@
+[Unit]
+Description=Kiosk WiFi watchdog (power-save off + link recovery escalation)
+# Replaces kiosk-wifi-powersave.service: same 60s power_save re-assert, plus a
+# gateway health check with an escalation ladder (interface bounce -> driver
+# module reload -> guarded reboot) for WiFi stacks that degrade over hours of
+# sustained streaming and only recover when the hardware is re-initialised.
+# Harmless no-op on wired-only screens and whenever the default route is wired.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStart=/usr/local/sbin/kiosk-wifi-watchdog
+
+[Install]
+WantedBy=multi-user.target
