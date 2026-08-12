@@ -20,6 +20,9 @@
 #   - corrupt frames are dropped at the decoder instead of rendered, so a
 #     glitch is a blink on one tile, not a white/grey smear that persists
 #     until the next keyframe
+#   - a latency governor keeps every tile within ~2s of live: backlog left
+#     behind by stalls is burned off at 2x speed instead of parking the tile
+#     20-40s behind realtime forever
 #
 # A config change still only needs mpv killed (the agent does `pkill mpv`);
 # the supervisor also polls the config file and rebuilds the wall within a few
@@ -135,15 +138,23 @@ print(" ".join(out))
 PY
 }
 
-# Sends one command (e.g. loadfile) to a tile's mpv; fire-and-forget.
+# Sends one command (e.g. loadfile, set_property) to a tile's mpv; fire-and-forget.
+# Numeric-looking arguments are sent as numbers (set_property speed needs a number).
 mpv_cmd() { # mpv_cmd SOCKET CMD ARG...
   python3 - "$@" <<'PY' 2>/dev/null
 import json, socket, sys
+args = []
+for a in sys.argv[2:]:
+    try:
+        v = json.loads(a)
+        args.append(v if isinstance(v, (int, float, bool)) else a)
+    except ValueError:
+        args.append(a)
 try:
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(2)
     s.connect(sys.argv[1])
-    s.sendall(json.dumps({"command": sys.argv[2:]}).encode() + b"\n")
+    s.sendall(json.dumps({"command": args}).encode() + b"\n")
     s.recv(4096)
 except OSError:
     pass
@@ -163,16 +174,22 @@ PY
 #     as a paused picture that resumes, never a black cell + window teardown.
 #   force-window=immediate: the cell goes up black right away instead of the
 #     root showing through while the RTSP handshake runs.
+#   latency: no-audio + video-latency-hacks trim fixed pipeline delay, and
+#     cache-secs bounds how much backlog can pile up behind live (~10s worst
+#     case instead of the 8M byte cap's 30-60s at substream bitrates). Every
+#     stall leaves backlog that 1x playback never burns off - the supervisor's
+#     latency governor (see supervise) plays 2x until the tile is back at live.
 #   msg-level (not really-quiet): real errors reach the journal so a sick
 #     stream is diagnosable.
 COMMON_FLAGS=(--no-osc --no-input-default-bindings --no-border --no-keepaspect
               --force-window=immediate
               --keep-open=yes --idle=yes
+              --no-audio --video-latency-hacks=yes
               --msg-level=all=error
               --hwdec=auto --rtsp-transport=tcp --network-timeout=15
               --demuxer-lavf-o-add=fflags=+discardcorrupt
               --vd-lavc-o-add=err_detect=+crccheck+bitstream+buffer
-              --cache=yes --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
+              --cache=yes --cache-secs=10 --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
 
 # One tile's respawn loop: probe, play, repeat. Runs in the background; the
 # supervisor kills the mpv pid (from the pidfile) to force a single-tile
@@ -350,7 +367,7 @@ supervise() {
       fi
 
       sock=$RUN_DIR/kiosk-tile-$pos.sock
-      read -r tp ct eof idle < <(mpv_props "$sock" time-pos demuxer-cache-time eof-reached idle-active)
+      read -r tp ct eof idle lag speed < <(mpv_props "$sock" time-pos demuxer-cache-time eof-reached idle-active demuxer-cache-duration speed)
 
       if [[ $eof == 1 || $idle == 1 ]]; then
         # stream over (keep-open holds the last frame; idle = load failed, black).
@@ -388,6 +405,20 @@ supervise() {
         last_tp[$pos]=$tp; stall_tp[$pos]=0
       else
         stall_tp[$pos]=$(( ${stall_tp[$pos]:-0} + WATCH_INTERVAL ))
+      fi
+
+      # Latency governor: every stall leaves a backlog in the demuxer cache that timed 1x
+      # playback carries forever - the wall drifts behind live and stays there. A healthy
+      # tile more than 2s behind plays at 2x (a brief fast-forward) until it is within
+      # 0.5s of live again.
+      if (( stall_tp[$pos] == 0 )) && [[ $lag != - && $speed != - ]]; then
+        if awk -v l="$lag" -v s="$speed" 'BEGIN{exit !(s < 1.1 && l > 2)}'; then
+          say "tile $pos: ${lag%.*}s behind live - catching up at 2x"
+          mpv_cmd "$sock" set_property speed 2
+        elif awk -v l="$lag" -v s="$speed" 'BEGIN{exit !(s > 1.1 && l < 0.5)}'; then
+          say "tile $pos: caught up to live"
+          mpv_cmd "$sock" set_property speed 1
+        fi
       fi
       if [[ $ct != - && $ct != "${last_ct[$pos]:-}" ]]; then
         last_ct[$pos]=$ct; stall_ct[$pos]=0

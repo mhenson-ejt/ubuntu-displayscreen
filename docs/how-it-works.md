@@ -113,7 +113,8 @@ its own cell, and each cell can be restarted invisibly to the rest.
 | `--vd-lavc-o-add=err_detect=+crccheck+bitstream+buffer` | detect decode errors. Deliberately **not** `+explode`: that made decode errors fatal and left mpv alive with a black window and no clock (the v1.9 "tile stays black until reboot" bug) |
 | `--keep-open=yes --idle=yes` | when the stream dies, mpv does **not** exit — it holds the last frame and waits; the supervisor reloads in place (see below). An outage looks like a paused picture, never a black cell |
 | `--network-timeout=15` | a fully dead connection errors out within ~15 s instead of hanging forever |
-| `--cache=yes --demuxer-max-bytes=8M` | small cache absorbs network/CPU hiccups; ~1 s extra latency is invisible on a wall |
+| `--cache=yes --cache-secs=10 --demuxer-max-bytes=8M` | small cache absorbs network/CPU hiccups; `cache-secs` bounds how far behind live a tile can drift (~10 s worst case — the 8M byte cap alone allowed 30–60 s at substream bitrates) |
+| `--no-audio --video-latency-hacks=yes` | walls don't play audio; both trim fixed pipeline latency |
 | `--force-window=immediate` | the cell appears (black) instantly while the RTSP handshake runs |
 | `--hwdec=auto` | VAAPI (i965) hardware decode where available |
 | `--no-border --no-keepaspect` | fill the cell exactly |
@@ -137,9 +138,10 @@ The main script becomes the supervisor once the wall is up. Every 5 s
 1. **Config check** — md5 of `config.json`; on change, tear down all tiles and
    rebuild the wall. This is why the agent's `pkill mpv` is only a speed-up.
 2. **Loop check** — a tile whose respawn loop died is respawned.
-3. **Health check** — one IPC round-trip per player fetches four properties:
+3. **Health check** — one IPC round-trip per player fetches six properties:
    `time-pos` (playback clock), `demuxer-cache-time` (is data arriving),
-   `eof-reached`, `idle-active`.
+   `eof-reached`, `idle-active`, `demuxer-cache-duration` (how far behind
+   live), `speed`.
 
 The policy is "recover with the least visible disruption that actually
 helps". History taught us the failure modes must be told apart — v2.0 used
@@ -157,6 +159,15 @@ players that were mid-buffer and about to resume by themselves:
 NVR reachability is probed at most once per NVR per sweep (tiles usually
 share an NVR). If `python3` is missing the health checks are disabled with a
 logged warning; config reload still works.
+
+**Latency governor.** Every stall (buffering pause, brief starvation) leaves
+a backlog in the demuxer cache, and timed playback at 1× carries that backlog
+forever — tiles used to drift 20–40 s behind realtime and stay there. The
+supervisor watches `demuxer-cache-duration`: a healthy tile more than 2 s
+behind live is played at 2× (`set_property speed 2` over IPC — a brief,
+barely visible fast-forward) until it is within 0.5 s, then restored to 1×.
+Combined with `cache-secs=10`, worst-case drift is ~10 s and it self-heals in
+seconds.
 
 ### Logging
 
@@ -331,3 +342,4 @@ Camera-side settings that matter:
 | 2.2 | failure-aware policy: in-place reloads, last-frame hold, starvation patience (§4) |
 | 2.3 | power-save re-asserted every 60 s |
 | 2.4 | power-save unit grew into the WiFi watchdog: gateway health check with bounce → driver reload → guarded reboot escalation, for WiFi stacks that degrade over hours until re-initialised |
+| 2.5 | latency governor: tiles >2 s behind live play at 2× until caught up; `cache-secs=10` bounds drift; `no-audio` + `video-latency-hacks` trim fixed delay (tiles used to park 20–40 s behind realtime) |
