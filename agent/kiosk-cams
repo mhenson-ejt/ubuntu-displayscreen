@@ -34,9 +34,15 @@
 #   { "gridCols": 3, "gridRows": 2, "subtype": 1,
 #     "rotate": "none", "rotateOutput": null,
 #     "tiles": [ {"pos": 0, "ip": "..", "port": 554,
-#                 "user": "..", "pass": "..", "channel": 1, "subtype": 0}, ... ] }
+#                 "user": "..", "pass": "..", "channel": 1, "subtype": 0,
+#                 "url": "rtsp://dsm:pw@relay-host:8554/nvr1-ch1-sub0"}, ... ] }
 # Per-tile "subtype" (0 = main stream, 1 = substream) overrides the top-level
 # default for that camera; tiles without it use the top-level "subtype".
+# Per-tile "url" (v2.6+) is the PREFERRED source - the manager's RTSP relay,
+# which holds one upstream NVR session per camera and fans it out to every
+# screen watching it. The direct-NVR fields stay as the fallback: a tile plays
+# the relay when it answers, falls back to the NVR when it doesn't, and the
+# supervisor switches back (in place, no teardown) once the relay recovers.
 #
 # Set KIOSK_DRYRUN=1 to print the xrandr/mpv commands instead of running them
 # (used by tests; no X or mpv needed).
@@ -48,6 +54,8 @@ STARVE_SECS=180    # network starvation (last frame showing, mpv will resume by
                    # itself when data returns): only restart as a last resort -
                    # killing a starved player just turns a frozen frame into a
                    # black cell and a reconnect over the same bad network
+RELAY_RETRY_SECS=600    # how often a tile on the direct fallback re-tries the relay
+RELAY_BURNT_SECS=1800   # relay retry backoff after a switchback that immediately failed
 RUN_DIR=${KIOSK_RUN_DIR:-/tmp}
 
 # logger, not stderr: startx swallows the X clients' stderr, so journald never saw these
@@ -74,6 +82,19 @@ urlencode() {
     case $c in [a-zA-Z0-9.~_-]) out+=$c ;; *) printf -v hex '%%%02X' "'$c"; out+=$hex ;; esac
   done
   echo "$out"
+}
+
+rtsp_hostport() { # rtsp_hostport RTSP-URL -> "host port" (creds/path stripped; port defaults 554)
+  local u=${1#rtsp://}
+  u=${u#*@}
+  u=${u%%/*}
+  local host=${u%%:*} port=${u##*:}
+  [[ $port == "$u" ]] && port=554
+  echo "$host $port"
+}
+
+current_src() { # current_src POS -> the URL the tile's player is currently on
+  cat "$RUN_DIR/kiosk-tile-$1.src" 2>/dev/null
 }
 
 apply_rotation() { # apply_rotation none|left|right OUTPUT-or-empty
@@ -191,19 +212,33 @@ COMMON_FLAGS=(--no-osc --no-input-default-bindings --no-border --no-keepaspect
               --vd-lavc-o-add=err_detect=+crccheck+bitstream+buffer
               --cache=yes --cache-secs=10 --demuxer-max-bytes=8M --demuxer-max-back-bytes=2M)
 
-# One tile's respawn loop: probe, play, repeat. Runs in the background; the
-# supervisor kills the mpv pid (from the pidfile) to force a single-tile
-# restart, or kills this loop + the pid to tear the wall down.
-tile_loop() { # tile_loop POS URL IP PORT GEOMETRY
-  local pos=$1 url=$2 ip=$3 port=$4 geometry=$5
+# One tile's respawn loop: pick a source (relay preferred, direct NVR fallback), play, repeat.
+# Runs in the background; the supervisor kills the mpv pid (from the pidfile) to force a
+# single-tile restart, or kills this loop + the pid to tear the wall down. The chosen source is
+# recorded in the .src file so the supervisor knows what the player is on.
+tile_loop() { # tile_loop POS DIRECT-URL NVR-IP NVR-PORT GEOMETRY RELAY-URL
+  local pos=$1 direct=$2 ip=$3 port=$4 geometry=$5 relay=${6:-}
   local sock=$RUN_DIR/kiosk-tile-$pos.sock pidfile=$RUN_DIR/kiosk-tile-$pos.pid
+  local srcfile=$RUN_DIR/kiosk-tile-$pos.src
+  local src rhost rport
   while true; do
-    if ! reachable "$ip" "$port"; then
-      say "tile $pos: NVR $ip:$port unreachable - black cell, retrying in 15s"
-      sleep 15
-      continue
+    src=""
+    if [[ -n $relay ]]; then
+      read -r rhost rport < <(rtsp_hostport "$relay")
+      reachable "$rhost" "$rport" && src=$relay
     fi
-    mpv "${COMMON_FLAGS[@]}" --geometry="$geometry" --input-ipc-server="$sock" "$url" &
+    if [[ -z $src ]]; then
+      if reachable "$ip" "$port"; then
+        src=$direct
+        [[ -n $relay ]] && say "tile $pos: relay unreachable - using the direct NVR stream"
+      else
+        say "tile $pos: no reachable source (relay or NVR) - black cell, retrying in 15s"
+        sleep 15
+        continue
+      fi
+    fi
+    echo "$src" > "$srcfile"
+    mpv "${COMMON_FLAGS[@]}" --geometry="$geometry" --input-ipc-server="$sock" "$src" &
     echo $! > "$pidfile"
     wait $!
     rm -f "$pidfile"    # no pidfile between spawns - the watchdog must never kill a stale pid
@@ -215,7 +250,8 @@ tile_loop() { # tile_loop POS URL IP PORT GEOMETRY
 # pos-indexed wall state, set by build_wall; kept global so the supervisor can
 # respawn a tile loop that has died
 TILE_LOOP_PID=()
-TILE_URL=()
+TILE_URL=()     # direct NVR URL (the always-available fallback)
+TILE_RELAY=()   # relay URL (preferred; empty when the relay feature is off)
 TILE_IP=()
 TILE_PORT=()
 TILE_GEOM=()
@@ -234,11 +270,11 @@ stop_tiles() {
     kill "${TILE_LOOP_PID[$pos]}" 2>/dev/null
     pid=$(tile_mpv_pid "$pos")
     [[ -n $pid ]] && kill "$pid" 2>/dev/null
-    rm -f "$RUN_DIR/kiosk-tile-$pos.pid" "$RUN_DIR/kiosk-tile-$pos.sock"
+    rm -f "$RUN_DIR/kiosk-tile-$pos.pid" "$RUN_DIR/kiosk-tile-$pos.sock" "$RUN_DIR/kiosk-tile-$pos.src"
   done
   # catch any player that was mid-spawn when its loop died (pidfile not yet written)
   pkill -x mpv 2>/dev/null
-  TILE_LOOP_PID=(); TILE_URL=(); TILE_IP=(); TILE_PORT=(); TILE_GEOM=()
+  TILE_LOOP_PID=(); TILE_URL=(); TILE_RELAY=(); TILE_IP=(); TILE_PORT=(); TILE_GEOM=()
 }
 
 # Parses the config and starts one tile_loop per usable tile.
@@ -262,14 +298,15 @@ build_wall() {
   # Per-position stream URL + NVR endpoint; tiles outside the grid or with
   # broken fields are skipped (that cell stays black) rather than holding the
   # rest of the wall hostage.
-  local url=() tip=() tport=()
-  local i pos ip port user pass ch tsub fields
+  local url=() tip=() tport=() trelay=()
+  local i pos ip port user pass ch tsub turl fields
   for (( i=0; i<ntiles; i++ )); do
     # tr strips CRs so CRLF from any jq/file source can't corrupt the fields
-    readarray -t fields < <(jq -r ".tiles[$i] | .pos, .ip, .port, .user, .pass, .channel, (.subtype // \"\")" "$CONFIG" | tr -d '\r')
+    readarray -t fields < <(jq -r ".tiles[$i] | .pos, .ip, .port, .user, .pass, .channel, (.subtype // \"\"), (.url // \"\")" "$CONFIG" | tr -d '\r')
     pos=${fields[0]}; ip=${fields[1]}; port=${fields[2]}
-    user=${fields[3]}; pass=${fields[4]}; ch=${fields[5]}; tsub=${fields[6]}
+    user=${fields[3]}; pass=${fields[4]}; ch=${fields[5]}; tsub=${fields[6]}; turl=${fields[7]:-}
     [[ $tsub =~ ^[01]$ ]] || tsub=$subtype
+    [[ $turl == rtsp://* ]] || turl=""
     [[ $pos =~ ^[0-9]+$ ]] && (( pos < n )) || continue
     if [[ -z $ip || $ip == null || -z $user || $user == null || -z $pass || $pass == null ]]; then
       say "tile $pos is missing ip/user/pass - leaving that cell black"; continue
@@ -277,7 +314,7 @@ build_wall() {
     [[ $ch =~ ^[0-9]+$ ]] && (( ch >= 1 )) || { say "tile $pos has an invalid channel - leaving that cell black"; continue; }
     [[ $port =~ ^[0-9]+$ ]] || port=554
     url[$pos]="rtsp://${user}:$(urlencode "$pass")@${ip}:${port}/cam/realmonitor?channel=${ch}&subtype=${tsub}"
-    tip[$pos]=$ip; tport[$pos]=$port
+    tip[$pos]=$ip; tport[$pos]=$port; trelay[$pos]=$turl
   done
 
   local have=0
@@ -303,12 +340,12 @@ build_wall() {
     geometry="${w}x${h}+${x}+${y}"
     if [[ -n ${KIOSK_DRYRUN:-} ]]; then
       printf 'MPV tile%s' "$pos"
-      printf ' %s' "${COMMON_FLAGS[@]}" "--geometry=$geometry" "${url[$pos]}"
+      printf ' %s' "${COMMON_FLAGS[@]}" "--geometry=$geometry" "${trelay[$pos]:-${url[$pos]}}"
       printf '\n'
     else
-      TILE_URL[$pos]=${url[$pos]}; TILE_IP[$pos]=${tip[$pos]}
+      TILE_URL[$pos]=${url[$pos]}; TILE_RELAY[$pos]=${trelay[$pos]:-}; TILE_IP[$pos]=${tip[$pos]}
       TILE_PORT[$pos]=${tport[$pos]}; TILE_GEOM[$pos]=$geometry
-      tile_loop "$pos" "${url[$pos]}" "${tip[$pos]}" "${tport[$pos]}" "$geometry" &
+      tile_loop "$pos" "${url[$pos]}" "${tip[$pos]}" "${tport[$pos]}" "$geometry" "${trelay[$pos]:-}" &
       TILE_LOOP_PID[$pos]=$!
     fi
   done
@@ -335,7 +372,7 @@ build_wall() {
 supervise() {
   local cfg_sig
   cfg_sig=$(md5sum "$CONFIG" 2>/dev/null)
-  local -A last_tp last_ct stall_tp stall_ct eof_stall retry nvr_ok
+  local -A last_tp last_ct stall_tp stall_ct eof_stall retry nvr_ok sb_timer sb_recent
   local have_python=1
   command -v python3 >/dev/null || { have_python=0; say "python3 not found - tile watchdog disabled (config reload still works)"; }
 
@@ -347,12 +384,12 @@ supervise() {
       return 0
     fi
 
-    local pos pid sock tp ct eof idle reason key
-    nvr_ok=()   # NVR reachability, probed at most once per NVR per sweep
+    local pos pid sock tp ct eof idle reason key cur relay rhost rport
+    nvr_ok=()   # source-host reachability, probed at most once per host per sweep
     for pos in "${!TILE_LOOP_PID[@]}"; do
       if ! kill -0 "${TILE_LOOP_PID[$pos]}" 2>/dev/null; then
         say "tile $pos: respawn loop died - restarting it"
-        tile_loop "$pos" "${TILE_URL[$pos]}" "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}" "${TILE_GEOM[$pos]}" &
+        tile_loop "$pos" "${TILE_URL[$pos]}" "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}" "${TILE_GEOM[$pos]}" "${TILE_RELAY[$pos]:-}" &
         TILE_LOOP_PID[$pos]=$!
         last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0; eof_stall[$pos]=0; retry[$pos]=0
         continue
@@ -371,35 +408,89 @@ supervise() {
 
       if [[ $eof == 1 || $idle == 1 ]]; then
         # stream over (keep-open holds the last frame; idle = load failed, black).
-        # Reload in-place once the NVR answers; the window never tears down.
+        # Reload the CURRENT source in-place once its host answers; never tear the window down.
         last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0
-        key="${TILE_IP[$pos]}:${TILE_PORT[$pos]}"
+        cur=$(current_src "$pos"); [[ -n $cur ]] || cur=${TILE_URL[$pos]}
+        relay=${TILE_RELAY[$pos]:-}
+
+        # a relay we only just switched back to has failed straight away - flip to the
+        # direct stream immediately and leave the relay alone for a long while
+        if [[ -n $relay && $cur == "$relay" ]] && (( ${sb_recent[$pos]:-0} > 0 )); then
+          say "tile $pos: relay failed right after switching back - direct NVR stream, retrying the relay later"
+          mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
+          echo "${TILE_URL[$pos]}" > "$RUN_DIR/kiosk-tile-$pos.src"
+          sb_recent[$pos]=0; sb_timer[$pos]=$RELAY_BURNT_SECS
+          eof_stall[$pos]=0; retry[$pos]=0
+          continue
+        fi
+
+        read -r rhost rport < <(rtsp_hostport "$cur")
+        key="$rhost:$rport"
         if [[ -z ${nvr_ok[$key]:-} ]]; then
-          if reachable "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}"; then nvr_ok[$key]=1; else nvr_ok[$key]=0; fi
+          if reachable "$rhost" "$rport"; then nvr_ok[$key]=1; else nvr_ok[$key]=0; fi
         fi
         if [[ ${nvr_ok[$key]} == 1 ]]; then
-          # the give-up clock only ticks while the NVR is answering: after a
+          # the give-up clock only ticks while the source host is answering: after a
           # long outage the FIRST action is a seamless reload, not a restart
           eof_stall[$pos]=$(( ${eof_stall[$pos]:-0} + WATCH_INTERVAL ))
           if (( eof_stall[$pos] >= STARVE_SECS )); then
-            say "tile $pos: reloads got nowhere for ${eof_stall[$pos]}s - restarting that camera's player"
-            kill "$pid" 2>/dev/null
-            eof_stall[$pos]=0; retry[$pos]=0
+            if [[ -n $relay && $cur == "$relay" ]]; then
+              # the relay answers TCP but its stream goes nowhere - use the direct
+              # NVR stream instead (in place); the switchback timer retries the relay
+              say "tile $pos: relay stream getting nowhere - switching to the direct NVR stream"
+              mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
+              echo "${TILE_URL[$pos]}" > "$RUN_DIR/kiosk-tile-$pos.src"
+              sb_timer[$pos]=$RELAY_RETRY_SECS
+              eof_stall[$pos]=0; retry[$pos]=0
+            else
+              say "tile $pos: reloads got nowhere for ${eof_stall[$pos]}s - restarting that camera's player"
+              kill "$pid" 2>/dev/null
+              eof_stall[$pos]=0; retry[$pos]=0
+            fi
           else
             retry[$pos]=$(( ${retry[$pos]:-0} - WATCH_INTERVAL ))
             if (( retry[$pos] <= 0 )); then
               say "tile $pos: stream ended - reloading in place (picture holds, no teardown)"
-              mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
+              mpv_cmd "$sock" loadfile "$cur" replace
               retry[$pos]=15
             fi
           fi
         else
-          # NVR unreachable - hold the last frame; nothing we do would help
+          # source host unreachable - hold the last frame; if the tile is on the relay and
+          # the relay HOST is gone, drop to the direct stream rather than waiting it out
+          if [[ -n $relay && $cur == "$relay" ]] && reachable "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}"; then
+            say "tile $pos: relay unreachable - switching to the direct NVR stream"
+            mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
+            echo "${TILE_URL[$pos]}" > "$RUN_DIR/kiosk-tile-$pos.src"
+            sb_timer[$pos]=$RELAY_RETRY_SECS
+          fi
           eof_stall[$pos]=0; retry[$pos]=0
         fi
         continue
       fi
       eof_stall[$pos]=0; retry[$pos]=0
+
+      # relay switchback: a healthy tile on the direct fallback re-tries the relay every
+      # RELAY_RETRY_SECS - in place, so a working relay just takes over seamlessly; if it
+      # fails within a minute the eof branch flips straight back and backs off for longer
+      if (( ${sb_recent[$pos]:-0} > 0 )); then sb_recent[$pos]=$(( sb_recent[$pos] - WATCH_INTERVAL )); fi
+      relay=${TILE_RELAY[$pos]:-}
+      if [[ -n $relay ]]; then
+        cur=$(current_src "$pos")
+        if [[ -n $cur && $cur != "$relay" ]]; then
+          sb_timer[$pos]=$(( ${sb_timer[$pos]:-$RELAY_RETRY_SECS} - WATCH_INTERVAL ))
+          if (( sb_timer[$pos] <= 0 )); then
+            sb_timer[$pos]=$RELAY_RETRY_SECS
+            read -r rhost rport < <(rtsp_hostport "$relay")
+            if reachable "$rhost" "$rport"; then
+              say "tile $pos: relay is back - switching to it (in place)"
+              mpv_cmd "$sock" loadfile "$relay" replace
+              echo "$relay" > "$RUN_DIR/kiosk-tile-$pos.src"
+              sb_recent[$pos]=60
+            fi
+          fi
+        fi
+      fi
 
       if [[ $tp != - && $tp != "${last_tp[$pos]:-}" ]]; then
         last_tp[$pos]=$tp; stall_tp[$pos]=0

@@ -77,16 +77,26 @@ requirement.
   "rotate": "none", "rotateOutput": null,
   "wifiSsid": null, "wifiPassword": null,
   "tiles": [ { "pos": 0, "ip": "10.66.2.66", "port": 554,
-               "user": "dsm", "pass": "...", "channel": 1, "subtype": 0 } ] }
+               "user": "dsm", "pass": "...", "channel": 1, "subtype": 0,
+               "url": "rtsp://dsm:pw@relay:8554/nvr1-ch1-sub0" } ] }
 ```
 
 - Grid up to 6×6. `pos` is row-major (0 = top-left); positions without a tile
   stay black. Tiles may come from different NVRs.
 - `subtype`: 0 = main stream, 1 = substream. The per-tile value overrides the
   top-level default; tiles without one inherit it.
-- Stream URL per tile:
+- Direct stream URL per tile:
   `rtsp://user:pass@ip:port/cam/realmonitor?channel=N&subtype=S`
   (password URL-encoded; Dahua path).
+- `url` (v2.6+): the PREFERRED source — the manager's RTSP relay (MediaMTX on
+  the manager host), which holds **one** upstream NVR session per camera and
+  fans it out to every screen watching it (NVR session/bandwidth limits made
+  direct per-tile streams lag once the fleet grew). The direct fields above
+  always remain the fallback: a tile plays the relay when it answers, drops
+  to the NVR when it doesn't (spawn probe, or in-place `loadfile` switch),
+  and switches back — in place, no teardown — when the relay recovers
+  (re-tried every 10 min; a switchback that fails within a minute backs off
+  for 30 min). Agents older than v2.6 ignore `url` entirely.
 - Broken tiles (missing ip/user/pass, bad channel) are skipped with a log —
   one bad tile never holds the rest of the wall hostage.
 
@@ -151,7 +161,7 @@ players that were mid-buffer and about to resume by themselves:
 | Player state | Meaning | Action |
 |---|---|---|
 | clock advancing | healthy | nothing |
-| EOF / idle (last frame or black held) | stream ended, connection died, or load failed | **reload in place** over IPC (`loadfile <url> replace`) as soon as the NVR answers a TCP probe, retried every 15 s — the window never tears down, the picture pauses then resumes. Give up and restart the process only after 180 s of *reachable* reload attempts going nowhere (the give-up clock does not tick while the NVR is down, so post-outage recovery is always a seamless reload) |
+| EOF / idle (last frame or black held) | stream ended, connection died, or load failed | **reload in place** over IPC (`loadfile <url> replace`) as soon as the current source's host answers a TCP probe, retried every 15 s — the window never tears down, the picture pauses then resumes. If the tile is on the relay, a dead relay host or a relay stream that gets nowhere for 180 s switches the tile to the **direct NVR stream in place** instead of restarting. Otherwise, give up and restart the process only after 180 s of *reachable* reload attempts going nowhere (the give-up clock does not tick while the host is down, so post-outage recovery is always a seamless reload) |
 | clock stuck, data still arriving | wedged decoder | restart that tile after 30 s (`FREEZE_SECS`) — nothing else fixes it |
 | clock stuck, no data arriving | network starvation | leave it — mpv is showing the last frame and resumes by itself; restart only after 180 s (`STARVE_SECS`) as a last resort, because killing a buffering player trades a frozen frame for a black cell |
 | no clock at all for 30 s | black window that never started | restart — there is nothing on screen to preserve |
@@ -343,3 +353,4 @@ Camera-side settings that matter:
 | 2.3 | power-save re-asserted every 60 s |
 | 2.4 | power-save unit grew into the WiFi watchdog: gateway health check with bounce → driver reload → guarded reboot escalation, for WiFi stacks that degrade over hours until re-initialised |
 | 2.5 | latency governor: tiles >2 s behind live play at 2× until caught up; `cache-secs=10` bounds drift; `no-audio` + `video-latency-hacks` trim fixed delay (tiles used to park 20–40 s behind realtime) |
+| 2.6 | relay support: per-tile `url` (the manager's MediaMTX relay — one upstream NVR session per camera) preferred, direct NVR stream as the automatic fallback, seamless in-place switches both ways |
