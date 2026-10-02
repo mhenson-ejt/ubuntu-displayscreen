@@ -179,6 +179,24 @@ barely visible fast-forward) until it is within 0.5 s, then restored to 1×.
 Combined with `cache-secs=10`, worst-case drift is ~10 s and it self-heals in
 seconds.
 
+**Main-stream degrade (v2.7).** A main-stream tile in a grid should soften,
+never cut out: when a tile *provably* cannot sustain its main stream, the
+supervisor drops that one tile to the **substream twin of the same camera**
+(relay path `-sub0`→`-sub1`, direct URL `subtype=0`→`subtype=1`) — in place,
+no teardown — and retries the main stream every 30 min. Two triggers:
+- **lag-stuck**: >2 s behind live continuously for 120 s even at 2× — the
+  box's decode budget (these units have no H.265 hardware decoding, so H.265
+  mains are software-decoded) or the link can't keep up;
+- **churn**: 3 watchdog restarts/give-ups without a 10-min healthy run in
+  between.
+The `.degraded` marker file makes player respawns honour the state; the full
+relay/direct failover ladder keeps working on the substream twins while
+degraded. Journal lines name the tile, the trigger and the retry cadence.
+Estate note: setting a camera's **main stream to H.264** on the NVR lets
+these boxes hardware-decode it, which is what makes main-in-grid genuinely
+sustainable on wired screens (trade-off: H.264 recordings need ~30-50% more
+NVR storage for the same quality).
+
 ### Logging
 
 X swallows its clients' stderr, so the loop logs via `logger -t kiosk-cams`.
@@ -354,3 +372,4 @@ Camera-side settings that matter:
 | 2.4 | power-save unit grew into the WiFi watchdog: gateway health check with bounce → driver reload → guarded reboot escalation, for WiFi stacks that degrade over hours until re-initialised |
 | 2.5 | latency governor: tiles >2 s behind live play at 2× until caught up; `cache-secs=10` bounds drift; `no-audio` + `video-latency-hacks` trim fixed delay (tiles used to park 20–40 s behind realtime) |
 | 2.6 | relay support: per-tile `url` (the manager's MediaMTX relay — one upstream NVR session per camera) preferred, direct NVR stream as the automatic fallback, seamless in-place switches both ways |
+| 2.7 | main-stream degrade: a tile that provably can't sustain its main stream (lag-stuck 120 s or 3-restart churn) drops itself to the same camera's substream in place and retries main every 30 min — main-in-grid softens instead of greying out and starving neighbours |

@@ -56,6 +56,10 @@ STARVE_SECS=180    # network starvation (last frame showing, mpv will resume by
                    # black cell and a reconnect over the same bad network
 RELAY_RETRY_SECS=600    # how often a tile on the direct fallback re-tries the relay
 RELAY_BURNT_SECS=1800   # relay retry backoff after a switchback that immediately failed
+DEGRADE_LAG_SECS=120    # a MAIN-stream tile stuck >2s behind live this long is beyond the
+                        # box's decode/link budget - degrade it to the substream variant
+DEGRADE_CHURN=3         # ...or after this many restarts/give-ups without a long healthy run
+DEGRADE_RETRY_SECS=1800 # how often a degraded tile re-tries its main stream
 RUN_DIR=${KIOSK_RUN_DIR:-/tmp}
 
 # logger, not stderr: startx swallows the X clients' stderr, so journald never saw these
@@ -95,6 +99,19 @@ rtsp_hostport() { # rtsp_hostport RTSP-URL -> "host port" (creds/path stripped; 
 
 current_src() { # current_src POS -> the URL the tile's player is currently on
   cat "$RUN_DIR/kiosk-tile-$1.src" 2>/dev/null
+}
+
+# A main-stream URL's substream twin: relay paths flip -sub0 -> -sub1, direct Dahua
+# URLs flip subtype=0 -> subtype=1. Anything else passes through unchanged.
+to_substream() { # to_substream URL
+  local u=$1
+  u=${u//-sub0/-sub1}
+  u=${u//subtype=0/subtype=1}
+  echo "$u"
+}
+
+is_main_src() { # is_main_src URL -> true when a substream twin exists
+  [[ $(to_substream "$1") != "$1" ]]
 }
 
 apply_rotation() { # apply_rotation none|left|right OUTPUT-or-empty
@@ -237,6 +254,9 @@ tile_loop() { # tile_loop POS DIRECT-URL NVR-IP NVR-PORT GEOMETRY RELAY-URL
         continue
       fi
     fi
+    # a degraded tile (can't sustain its main stream - see the supervisor) spawns on
+    # the substream twin until the periodic main-stream retry clears the marker
+    [[ -f $RUN_DIR/kiosk-tile-$pos.degraded ]] && src=$(to_substream "$src")
     echo "$src" > "$srcfile"
     mpv "${COMMON_FLAGS[@]}" --geometry="$geometry" --input-ipc-server="$sock" "$src" &
     echo $! > "$pidfile"
@@ -270,7 +290,7 @@ stop_tiles() {
     kill "${TILE_LOOP_PID[$pos]}" 2>/dev/null
     pid=$(tile_mpv_pid "$pos")
     [[ -n $pid ]] && kill "$pid" 2>/dev/null
-    rm -f "$RUN_DIR/kiosk-tile-$pos.pid" "$RUN_DIR/kiosk-tile-$pos.sock" "$RUN_DIR/kiosk-tile-$pos.src"
+    rm -f "$RUN_DIR/kiosk-tile-$pos.pid" "$RUN_DIR/kiosk-tile-$pos.sock" "$RUN_DIR/kiosk-tile-$pos.src" "$RUN_DIR/kiosk-tile-$pos.degraded"
   done
   # catch any player that was mid-spawn when its loop died (pidfile not yet written)
   pkill -x mpv 2>/dev/null
@@ -369,10 +389,22 @@ build_wall() {
 #     there is no picture to preserve.
 # A tile whose loop died is respawned; no player running is fine (the loop is
 # between spawns or probing). Returns when the config file changes.
+# Drops a tile that provably cannot sustain its MAIN stream onto the substream twin of
+# whatever source it is on - in place, no teardown, no black. The marker file makes
+# tile_loop respawns honour it; the supervisor retries the main stream periodically.
+degrade_tile() { # degrade_tile POS SOCK CURRENT-URL REASON
+  local sub
+  sub=$(to_substream "$3")
+  say "tile $1: $4 - showing the substream instead (main stream retried every $(( DEGRADE_RETRY_SECS / 60 )) min)"
+  touch "$RUN_DIR/kiosk-tile-$1.degraded"
+  mpv_cmd "$2" loadfile "$sub" replace
+  echo "$sub" > "$RUN_DIR/kiosk-tile-$1.src"
+}
+
 supervise() {
   local cfg_sig
   cfg_sig=$(md5sum "$CONFIG" 2>/dev/null)
-  local -A last_tp last_ct stall_tp stall_ct eof_stall retry nvr_ok sb_timer sb_recent
+  local -A last_tp last_ct stall_tp stall_ct eof_stall retry nvr_ok sb_timer sb_recent lag_stuck churn healthy_run mret
   local have_python=1
   command -v python3 >/dev/null || { have_python=0; say "python3 not found - tile watchdog disabled (config reload still works)"; }
 
@@ -384,7 +416,7 @@ supervise() {
       return 0
     fi
 
-    local pos pid sock tp ct eof idle reason key cur relay rhost rport
+    local pos pid sock tp ct eof idle reason key cur relay direct orig rhost rport
     nvr_ok=()   # source-host reachability, probed at most once per host per sweep
     for pos in "${!TILE_LOOP_PID[@]}"; do
       if ! kill -0 "${TILE_LOOP_PID[$pos]}" 2>/dev/null; then
@@ -406,19 +438,41 @@ supervise() {
       sock=$RUN_DIR/kiosk-tile-$pos.sock
       read -r tp ct eof idle lag speed < <(mpv_props "$sock" time-pos demuxer-cache-time eof-reached idle-active demuxer-cache-duration speed)
 
+      # effective sources for this tile: a degraded tile (couldn't sustain its MAIN
+      # stream) runs on the substream twins of its configured URLs until the periodic
+      # main-stream retry below clears the marker
+      relay=${TILE_RELAY[$pos]:-}
+      direct=${TILE_URL[$pos]}
+      if [[ -f $RUN_DIR/kiosk-tile-$pos.degraded ]]; then
+        mret[$pos]=$(( ${mret[$pos]:-$DEGRADE_RETRY_SECS} - WATCH_INTERVAL ))
+        if (( mret[$pos] <= 0 )); then
+          mret[$pos]=$DEGRADE_RETRY_SECS
+          rm -f "$RUN_DIR/kiosk-tile-$pos.degraded"
+          cur=$(current_src "$pos")
+          orig=$direct
+          [[ -n $relay && $cur == "$(to_substream "$relay")" ]] && orig=$relay
+          say "tile $pos: retrying the main stream"
+          mpv_cmd "$sock" loadfile "$orig" replace
+          echo "$orig" > "$RUN_DIR/kiosk-tile-$pos.src"
+          lag_stuck[$pos]=0
+          continue
+        fi
+        [[ -n $relay ]] && relay=$(to_substream "$relay")
+        direct=$(to_substream "$direct")
+      fi
+
       if [[ $eof == 1 || $idle == 1 ]]; then
         # stream over (keep-open holds the last frame; idle = load failed, black).
         # Reload the CURRENT source in-place once its host answers; never tear the window down.
-        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0
-        cur=$(current_src "$pos"); [[ -n $cur ]] || cur=${TILE_URL[$pos]}
-        relay=${TILE_RELAY[$pos]:-}
+        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0; healthy_run[$pos]=0
+        cur=$(current_src "$pos"); [[ -n $cur ]] || cur=$direct
 
         # a relay we only just switched back to has failed straight away - flip to the
         # direct stream immediately and leave the relay alone for a long while
         if [[ -n $relay && $cur == "$relay" ]] && (( ${sb_recent[$pos]:-0} > 0 )); then
           say "tile $pos: relay failed right after switching back - direct NVR stream, retrying the relay later"
-          mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
-          echo "${TILE_URL[$pos]}" > "$RUN_DIR/kiosk-tile-$pos.src"
+          mpv_cmd "$sock" loadfile "$direct" replace
+          echo "$direct" > "$RUN_DIR/kiosk-tile-$pos.src"
           sb_recent[$pos]=0; sb_timer[$pos]=$RELAY_BURNT_SECS
           eof_stall[$pos]=0; retry[$pos]=0
           continue
@@ -438,13 +492,19 @@ supervise() {
               # the relay answers TCP but its stream goes nowhere - use the direct
               # NVR stream instead (in place); the switchback timer retries the relay
               say "tile $pos: relay stream getting nowhere - switching to the direct NVR stream"
-              mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
-              echo "${TILE_URL[$pos]}" > "$RUN_DIR/kiosk-tile-$pos.src"
+              mpv_cmd "$sock" loadfile "$direct" replace
+              echo "$direct" > "$RUN_DIR/kiosk-tile-$pos.src"
               sb_timer[$pos]=$RELAY_RETRY_SECS
               eof_stall[$pos]=0; retry[$pos]=0
             else
-              say "tile $pos: reloads got nowhere for ${eof_stall[$pos]}s - restarting that camera's player"
-              kill "$pid" 2>/dev/null
+              churn[$pos]=$(( ${churn[$pos]:-0} + 1 ))
+              if is_main_src "$cur" && (( churn[$pos] >= DEGRADE_CHURN )); then
+                degrade_tile "$pos" "$sock" "$cur" "keeps failing on its main stream (${churn[$pos]} restarts)"
+                churn[$pos]=0; mret[$pos]=$DEGRADE_RETRY_SECS
+              else
+                say "tile $pos: reloads got nowhere for ${eof_stall[$pos]}s - restarting that camera's player"
+                kill "$pid" 2>/dev/null
+              fi
               eof_stall[$pos]=0; retry[$pos]=0
             fi
           else
@@ -460,8 +520,8 @@ supervise() {
           # the relay HOST is gone, drop to the direct stream rather than waiting it out
           if [[ -n $relay && $cur == "$relay" ]] && reachable "${TILE_IP[$pos]}" "${TILE_PORT[$pos]}"; then
             say "tile $pos: relay unreachable - switching to the direct NVR stream"
-            mpv_cmd "$sock" loadfile "${TILE_URL[$pos]}" replace
-            echo "${TILE_URL[$pos]}" > "$RUN_DIR/kiosk-tile-$pos.src"
+            mpv_cmd "$sock" loadfile "$direct" replace
+            echo "$direct" > "$RUN_DIR/kiosk-tile-$pos.src"
             sb_timer[$pos]=$RELAY_RETRY_SECS
           fi
           eof_stall[$pos]=0; retry[$pos]=0
@@ -474,9 +534,8 @@ supervise() {
       # RELAY_RETRY_SECS - in place, so a working relay just takes over seamlessly; if it
       # fails within a minute the eof branch flips straight back and backs off for longer
       if (( ${sb_recent[$pos]:-0} > 0 )); then sb_recent[$pos]=$(( sb_recent[$pos] - WATCH_INTERVAL )); fi
-      relay=${TILE_RELAY[$pos]:-}
+      cur=$(current_src "$pos")
       if [[ -n $relay ]]; then
-        cur=$(current_src "$pos")
         if [[ -n $cur && $cur != "$relay" ]]; then
           sb_timer[$pos]=$(( ${sb_timer[$pos]:-$RELAY_RETRY_SECS} - WATCH_INTERVAL ))
           if (( sb_timer[$pos] <= 0 )); then
@@ -510,13 +569,30 @@ supervise() {
           say "tile $pos: caught up to live"
           mpv_cmd "$sock" set_property speed 1
         fi
+        # a MAIN-stream tile that stays behind live even at 2x is beyond the box's
+        # decode/link budget - degrade it rather than letting it grey out and starve
+        # its neighbours (main-in-grid should soften, never cut out)
+        if awk -v l="$lag" 'BEGIN{exit !(l > 2)}'; then
+          lag_stuck[$pos]=$(( ${lag_stuck[$pos]:-0} + WATCH_INTERVAL ))
+          if (( lag_stuck[$pos] >= DEGRADE_LAG_SECS )) && is_main_src "$cur" && [[ ! -f $RUN_DIR/kiosk-tile-$pos.degraded ]]; then
+            degrade_tile "$pos" "$sock" "$cur" "stuck ${lag_stuck[$pos]}s behind live on its main stream (decode/link can't keep up)"
+            lag_stuck[$pos]=0; mret[$pos]=$DEGRADE_RETRY_SECS
+          fi
+        else
+          lag_stuck[$pos]=0
+        fi
       fi
       if [[ $ct != - && $ct != "${last_ct[$pos]:-}" ]]; then
         last_ct[$pos]=$ct; stall_ct[$pos]=0
       else
         stall_ct[$pos]=$(( ${stall_ct[$pos]:-0} + WATCH_INTERVAL ))
       fi
-      (( stall_tp[$pos] == 0 )) && continue
+      if (( stall_tp[$pos] == 0 )); then
+        # a long healthy run forgives past restarts (the churn-based degrade trigger)
+        healthy_run[$pos]=$(( ${healthy_run[$pos]:-0} + WATCH_INTERVAL ))
+        (( healthy_run[$pos] >= 600 )) && churn[$pos]=0
+        continue
+      fi
 
       reason=""
       if [[ ${last_tp[$pos]:-} == "" ]]; then
@@ -531,9 +607,15 @@ supervise() {
         (( stall_tp[$pos] >= STARVE_SECS )) && reason="no stream data for ${stall_tp[$pos]}s"
       fi
       if [[ -n $reason ]]; then
-        say "tile $pos: $reason - restarting that camera's player"
-        kill "$pid" 2>/dev/null
-        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0
+        churn[$pos]=$(( ${churn[$pos]:-0} + 1 ))
+        if is_main_src "$cur" && (( churn[$pos] >= DEGRADE_CHURN )); then
+          degrade_tile "$pos" "$sock" "$cur" "$reason after ${churn[$pos]} restarts on its main stream"
+          churn[$pos]=0; mret[$pos]=$DEGRADE_RETRY_SECS
+        else
+          say "tile $pos: $reason - restarting that camera's player"
+          kill "$pid" 2>/dev/null
+        fi
+        last_tp[$pos]=""; last_ct[$pos]=""; stall_tp[$pos]=0; stall_ct[$pos]=0; healthy_run[$pos]=0
       fi
     done
   done
