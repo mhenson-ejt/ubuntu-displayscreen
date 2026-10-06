@@ -85,14 +85,16 @@ WOL_MAC=""
 WOL_OK=false
 
 assert_wol() {
+  WOL_OK=false
   [[ -n $WOL_DEV ]] || return 0
   command -v ethtool >/dev/null 2>&1 || return 0
+  # WoL needs the cable: magic packets arrive on the wired segment, so a screen running on
+  # WiFi (wired NIC without carrier) must not advertise itself as WoL-wakeable - its RTC
+  # alarm is its only self-wake. Checked every tick, so plugging in / unplugging is tracked.
+  [[ $(cat "/sys/class/net/$WOL_DEV/carrier" 2>/dev/null) == 1 ]] || return 0
   ethtool -s "$WOL_DEV" wol g 2>/dev/null || true
-  if [[ $(ethtool "$WOL_DEV" 2>/dev/null | sed -n 's/^[[:space:]]*Wake-on: \(.*\)/\1/p') == *g* ]]; then
-    WOL_OK=true
-  else
-    WOL_OK=false
-  fi
+  [[ $(ethtool "$WOL_DEV" 2>/dev/null | sed -n 's/^[[:space:]]*Wake-on: \(.*\)/\1/p') == *g* ]] && WOL_OK=true
+  return 0
 }
 
 probe_wake_caps() {
@@ -286,7 +288,14 @@ now_hm() { pdate -d "@$(now_epoch)" +%H:%M; }
 today_date() { pdate -d "@$(now_epoch)" +%F; }
 uptime_s() { awk '{print int($1)}' /proc/uptime; }
 power_off() { systemd-run --on-active=5 systemctl poweroff >/dev/null 2>&1 || systemctl poweroff; }
-rtc_arm() { rtcwake -m no -t "$1" >/dev/null 2>&1; }
+
+# arm AND verify: some firmware accepts rtcwake yet never stores the alarm - an empty
+# wakealarm means this box would sleep forever, so treat it as an arming failure and
+# let the caller fall down the ladder (WoL relay / display-off)
+rtc_arm() {
+  rtcwake -m no -t "$1" >/dev/null 2>&1 || return 1
+  [[ -s /sys/class/rtc/rtc0/wakealarm ]]
+}
 display_stop() { systemctl stop kiosk-display; }
 display_start() { systemctl start kiosk-display; }
 
