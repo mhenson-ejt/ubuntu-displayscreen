@@ -371,6 +371,21 @@ cat /etc/kiosk/config.json | jq .   # what the screen thinks it should show
 KIOSK_DRYRUN=1 /etc/kiosk/cams.sh   # print the xrandr/mpv commands without running them
 ```
 
+**BIOS prerequisites for the power schedule** (found the hard way on
+ejt-mb-wk-106, 2026-10-06: sleep worked, every wake path was dead): in S5 with
+Intel's deep-sleep setting on, the NUC powers down both the RTC alarm circuit
+and the NIC, so neither the armed RTC wake nor WoL magic packets can reach it
+— only the power button. On each screen, in BIOS setup (F2) under Power →
+Secondary Power Settings:
+
+- **Deep S4/S5 / Deep Sleep: Disabled**
+- **Wake on LAN from S4/S5: Power On – Normal Boot**
+
+Quick tell while a box is off: a dark Ethernet link LED means the NIC is
+unpowered and WoL cannot work. The agent's capability probe cannot see these
+BIOS settings — `rtcwake --dry-run` succeeds and `ethtool` reports `wol g`
+even when deep sleep will defeat both.
+
 Camera-side settings that matter:
 
 - **H.264 only** — the Intel i965 VAAPI driver cannot hardware-decode H.265.
