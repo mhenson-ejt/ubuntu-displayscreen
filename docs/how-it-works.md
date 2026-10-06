@@ -246,9 +246,30 @@ Runs as root, ticks every 15 s (`POLL_INTERVAL`). Each tick:
    user's `authorized_keys` as
    `restrict,command="sudo /usr/local/sbin/kiosk-trigger" <key>`.
 7. **Commands** — executes queued commands and acks each
-   (`restart-display`, `reboot`, `update-agent`; unknown types are acked as
-   errors). Reboot acks first, then reboots detached so the ack isn't killed
-   mid-flight.
+   (`restart-display`, `reboot`, `update-agent`, `wol:<mac>`; unknown types
+   are acked as errors). Reboot acks first, then reboots detached so the ack
+   isn't killed mid-flight.
+8. **Power schedule** (v2.8, FB-0176) — `config.json` may carry a `power`
+   block (`sleepTime`/`wakeTime` as local `HH:MM`, `daysMask` bit N =
+   day-of-week with Sunday=0, marking the days the screen *wakes* — sleep
+   fires daily, so a Mon–Fri mask sleeps Friday evening through Monday
+   morning). At the sleep minute the agent arms the RTC alarm for the next
+   scheduled wake (`rtcwake -m no -t`) and powers off cleanly. The trigger is
+   a 2-minute window at the sleep time, once per day, and a box with under
+   10 min uptime skips it — so a screen someone switches on during the sleep
+   window **stays up until the next scheduled sleep**. Fallback ladder: RTC
+   arm fails (or unsupported) but wake-on-LAN is armed → power off anyway and
+   rely on the manager's WoL relay; neither → display-off sleep
+   (`systemctl stop kiosk-display`, resumed at the stored wake time, or
+   immediately if the schedule is removed). The agent probes its wake
+   capabilities at startup (`rtcwake --dry-run`, wired NIC MAC, `ethtool`
+   Wake-on `g` — re-asserted every tick, since interface resets restore the
+   driver default, the same lesson the WiFi powersave watchdog learned) and
+   reports them on every poll (`rtcWakeSupported`/`wolMac`/`wolEnabled`,
+   additive). The manager relays wakes by queueing `wol:<12-hex-mac>` to an
+   awake sibling on the asleep screen's subnet; the sibling broadcasts three
+   magic packets (python, UDP :9) — magic packets don't cross VLANs, which is
+   why the server never sends them itself.
 
 **Instant sync:** the manager SSHes in as the kiosk user with that restricted
 key; the forced command runs `kiosk-trigger`, which sends SIGUSR1 to the
@@ -373,3 +394,4 @@ Camera-side settings that matter:
 | 2.5 | latency governor: tiles >2 s behind live play at 2× until caught up; `cache-secs=10` bounds drift; `no-audio` + `video-latency-hacks` trim fixed delay (tiles used to park 20–40 s behind realtime) |
 | 2.6 | relay support: per-tile `url` (the manager's MediaMTX relay — one upstream NVR session per camera) preferred, direct NVR stream as the automatic fallback, seamless in-place switches both ways |
 | 2.7 | main-stream degrade: a tile that provably can't sustain its main stream (lag-stuck 120 s or 3-restart churn) drops itself to the same camera's substream in place and retries main every 30 min — main-in-grid softens instead of greying out and starving neighbours |
+| 2.8 | power schedule (FB-0176): scheduled sleep via RTC-alarm self-wake, WoL relay through an awake sibling (`wol:` command), display-off fallback; wake capabilities reported on every poll; manual power-on during the sleep window stays up until the next scheduled sleep |

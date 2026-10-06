@@ -17,12 +17,20 @@
 #      a one-command sudoers rule), so the manager can wake this agent
 #      instantly (SIGUSR1) instead of waiting for the next poll.
 #   5. Executes queued commands (restart-display, reboot) and acks them.
+#   6. Enforces the power schedule (v2.8): at the scheduled sleep minute it
+#      arms the RTC alarm for the next scheduled wake and powers off; boxes
+#      whose RTC can't self-wake rely on a WoL relay (the manager queues a
+#      "wol:<mac>" command to an awake sibling on the same subnet), and boxes
+#      with neither fall back to display-off sleep. A manual power-on during
+#      the sleep window stays up until the NEXT scheduled sleep - the trigger
+#      only fires in a 2-minute window at the sleep time, and a recently
+#      booted box skips it.
 #
 # The manager being unreachable never affects the running display.
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.7"
+AGENT_VERSION="2.8"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -67,6 +75,56 @@ applied_version() { # applied_version FILE -> sanitized integer
   [[ $v =~ ^[0-9]+$ ]] && echo "$v" || echo 0
 }
 
+#--- Wake capabilities (v2.8) --------------------------------------------------
+# Probed once at startup, reported on every poll so the manager knows how this
+# box can be woken. WoL is re-asserted every tick: interface resets restore the
+# driver default, the same lesson the WiFi powersave watchdog learned.
+RTC_OK=false
+WOL_DEV=""
+WOL_MAC=""
+WOL_OK=false
+
+assert_wol() {
+  [[ -n $WOL_DEV ]] || return 0
+  command -v ethtool >/dev/null 2>&1 || return 0
+  ethtool -s "$WOL_DEV" wol g 2>/dev/null || true
+  if [[ $(ethtool "$WOL_DEV" 2>/dev/null | sed -n 's/^[[:space:]]*Wake-on: \(.*\)/\1/p') == *g* ]]; then
+    WOL_OK=true
+  else
+    WOL_OK=false
+  fi
+}
+
+probe_wake_caps() {
+  rtcwake --dry-run -m no -s 60 >/dev/null 2>&1 && RTC_OK=true
+
+  # the wired NIC carries WoL: the default-route device if it's ethernet, else the first en*/eth*
+  local dev d
+  dev=$(ip -o route show default 2>/dev/null | head -1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+  if [[ -z $dev || $dev == wl* || ! -e /sys/class/net/$dev/device ]]; then
+    dev=""
+    for d in /sys/class/net/en* /sys/class/net/eth*; do
+      [[ -e $d ]] && { dev=$(basename "$d"); break; }
+    done
+  fi
+  [[ -n $dev ]] || { log "wake-caps: rtc=$RTC_OK, no wired interface - WoL unavailable"; return 0; }
+  WOL_DEV=$dev
+  WOL_MAC=$(cat "/sys/class/net/$dev/address" 2>/dev/null || true)
+  assert_wol
+  log "wake-caps: rtc=$RTC_OK, wol=$WOL_OK ($WOL_DEV ${WOL_MAC:-no-mac})"
+}
+
+send_wol() { # send_wol MAC12HEX - broadcast a magic packet on the local subnet
+  python3 - "$1" <<'PY'
+import socket, sys
+pkt = bytes.fromhex('ff' * 6 + sys.argv[1] * 16)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+for _ in range(3):
+    s.sendto(pkt, ('255.255.255.255', 9))
+PY
+}
+
 build_status() {
   local active=false ip up
   systemctl is-active --quiet kiosk-display && active=true
@@ -77,8 +135,10 @@ build_status() {
         --arg v "$AGENT_VERSION" --argjson da "$active" \
         --arg ip "${ip:-}" --argjson up "${up:-0}" \
         --arg ku "${KIOSK_USER:-}" \
+        --argjson rtc "$RTC_OK" --arg wm "${WOL_MAC:-}" --argjson we "$WOL_OK" \
         '{appliedConfigVersion:$ac, appliedSshKeysVersion:$ak, agentVersion:$v,
-          displayActive:$da, localIp:$ip, uptimeSeconds:$up, kioskUser:$ku}'
+          displayActive:$da, localIp:$ip, uptimeSeconds:$up, kioskUser:$ku,
+          rtcWakeSupported:$rtc, wolMac:(if $wm == "" then null else $wm end), wolEnabled:$we}'
 }
 
 apply_config() {
@@ -187,6 +247,99 @@ apply_manager_key() {
   log "manager-key: installed v$ver for $KIOSK_USER (instant sync enabled)"
 }
 
+#--- Power schedule (v2.8) -----------------------------------------------------
+# config.json may carry .power {sleepTime "HH:MM", wakeTime "HH:MM", daysMask}.
+# daysMask bit N = day-of-week with Sunday=0 and marks the days the screen
+# WAKES; sleep fires daily at sleepTime, so a Mon-Fri mask sleeps Friday
+# evening through to Monday morning. Absent .power = never sleep.
+
+hm_to_min() { # "HH:MM" -> minutes since midnight, or -1 when malformed
+  [[ $1 =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || { echo -1; return; }
+  echo $(( 10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]} ))
+}
+
+next_wake_epoch() { # next_wake_epoch WAKE_HHMM DAYSMASK -> epoch of the next scheduled wake
+  local wake=$1 mask=$2 now base d target dow
+  now=$(now_epoch)
+  base=$(date -d "@$now" +%F)
+  for d in 0 1 2 3 4 5 6 7; do
+    target=$(date -d "$base + $d day $wake" +%s 2>/dev/null) || return 1
+    (( target > now + 120 )) || continue   # meaningfully in the future (beyond the trigger window)
+    dow=$(date -d "@$target" +%w)          # 0=Sunday, matching the mask convention
+    (( (mask >> dow) & 1 )) && { echo "$target"; return 0; }
+  done
+  return 1   # empty mask - nothing would ever wake us
+}
+
+# seams for the policy test harness - everything time-based derives from now_epoch
+now_epoch() { date +%s; }
+now_hm() { date -d "@$(now_epoch)" +%H:%M; }
+today_date() { date -d "@$(now_epoch)" +%F; }
+uptime_s() { awk '{print int($1)}' /proc/uptime; }
+power_off() { systemd-run --on-active=5 systemctl poweroff >/dev/null 2>&1 || systemctl poweroff; }
+rtc_arm() { rtcwake -m no -t "$1" >/dev/null 2>&1; }
+display_stop() { systemctl stop kiosk-display; }
+display_start() { systemctl start kiosk-display; }
+
+check_power_schedule() {
+  local cfg="$CONF_DIR/config.json"
+  local sleep_t="" wake_t="" mask=0
+  if [[ -r $cfg ]]; then
+    sleep_t=$(jq -r '.power.sleepTime // empty' "$cfg" 2>/dev/null)
+    wake_t=$(jq -r '.power.wakeTime // empty' "$cfg" 2>/dev/null)
+    mask=$(jq -r '.power.daysMask // 0' "$cfg" 2>/dev/null)
+  fi
+  [[ $mask =~ ^[0-9]+$ ]] || mask=0
+
+  # display-off sleep in progress: resume at the stored wake time, or as soon
+  # as the schedule is removed; never evaluate a new sleep while in it
+  if [[ -f $CONF_DIR/display-sleep-until ]]; then
+    local until
+    until=$(cat "$CONF_DIR/display-sleep-until" 2>/dev/null)
+    [[ $until =~ ^[0-9]+$ ]] || until=0
+    if [[ -z $sleep_t || $mask == 0 ]] || (( $(now_epoch) >= until )); then
+      rm -f "$CONF_DIR/display-sleep-until"
+      display_start
+      log "power: display-off sleep over - display restarted"
+    fi
+    return 0
+  fi
+
+  [[ -n $sleep_t && -n $wake_t && $mask != 0 ]] || return 0
+
+  local sleep_min now_min
+  sleep_min=$(hm_to_min "$sleep_t"); now_min=$(hm_to_min "$(now_hm)")
+  (( sleep_min >= 0 && now_min >= 0 )) || return 0
+
+  # the trigger is a 2-minute window at the sleep time, once per day - a box
+  # powered on manually later in the sleep window therefore stays up
+  (( now_min >= sleep_min && now_min < sleep_min + 2 )) || return 0
+  [[ $(cat "$CONF_DIR/last-sleep-date" 2>/dev/null) == "$(today_date)" ]] && return 0
+
+  # a recently booted box inside the window was woken on purpose - stay up
+  if (( $(uptime_s) < 600 )); then
+    log "power: inside the sleep window but only just booted - staying up until the next scheduled sleep"
+    return 0
+  fi
+
+  local wake_epoch
+  wake_epoch=$(next_wake_epoch "$wake_t" "$mask") || { log "power: no wake day in mask $mask - refusing to sleep"; return 0; }
+
+  echo "$(today_date)" > "$CONF_DIR/last-sleep-date"
+
+  if [[ $RTC_OK == true ]] && rtc_arm "$wake_epoch"; then
+    log "power: sleeping - RTC alarm armed for $(date -d "@$wake_epoch" '+%a %H:%M'), powering off"
+    power_off
+  elif [[ $WOL_OK == true ]]; then
+    log "power: sleeping - no RTC alarm, relying on wake-on-LAN relay at $(date -d "@$wake_epoch" '+%a %H:%M'), powering off"
+    power_off
+  else
+    log "power: no RTC alarm and no wake-on-LAN - display-off sleep until $(date -d "@$wake_epoch" '+%a %H:%M')"
+    echo "$wake_epoch" > "$CONF_DIR/display-sleep-until"
+    display_stop
+  fi
+}
+
 ack() { # ack COMMAND_ID RESULT MESSAGE
   local body out
   body=$(jq -n --arg r "$2" --arg m "$3" '{result:$r, message:$m}')
@@ -222,6 +375,16 @@ handle_command() {
         >/dev/null 2>&1 \
         || ack "$id" error "failed to launch the updater (see journalctl -u kiosk-agent-update)"
       ;;
+    wol:*)
+      # Relay a wake-on-LAN magic packet for an asleep sibling on OUR subnet (the manager can't
+      # send it itself - magic packets don't cross VLANs). MAC arrives as 12 bare hex digits.
+      local mac=${type#wol:}
+      if [[ $mac =~ ^[0-9a-fA-F]{12}$ ]] && send_wol "${mac,,}"; then
+        ack "$id" ok "magic packet broadcast for $mac"
+      else
+        ack "$id" error "bad MAC or send failed: $mac"
+      fi
+      ;;
     *)
       ack "$id" error "unknown command type: $type"
       ;;
@@ -248,6 +411,8 @@ tick() {
   source "$ENV_FILE" 2>/dev/null || { log "missing $ENV_FILE"; return; }
   source "$CONF_DIR/kiosk.conf" 2>/dev/null || true   # KIOSK_USER, KIOSK_HOME
   check_route_flip
+  assert_wol
+  check_power_schedule
   [[ -n ${MANAGER_URL:-} ]] || { log "no MANAGER_URL in $ENV_FILE"; return; }
   MANAGER_URL=${MANAGER_URL%/}
 
@@ -285,6 +450,10 @@ tick() {
   log "poll: ok (config v$(applied_version applied-config-version)/$cfg_ver, keys v$(applied_version applied-sshkeys-version)/$keys_ver, commands $ncmds)"
 }
 
+# Sourced by the policy test harness, which stubs the seams above and calls the
+# functions directly - everything below is the live main loop.
+[[ -n ${KIOSK_AGENT_TEST:-} ]] && return 0
+
 # SIGUSR1 (sent by kiosk-trigger when the manager SSHes in) interrupts the
 # sleep so changes apply instantly instead of waiting out the poll interval.
 # A signal that lands while a tick is still running skips the sleep entirely,
@@ -293,6 +462,7 @@ WOKEN=0
 trap 'WOKEN=1' USR1
 
 log "kiosk-agent $AGENT_VERSION starting (poll every ${POLL_INTERVAL}s; SIGUSR1 forces an immediate sync)"
+probe_wake_caps
 while true; do
   WOKEN=0
   TICK_START=$(date +%s)

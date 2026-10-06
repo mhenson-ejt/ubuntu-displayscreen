@@ -216,6 +216,16 @@ else
   log "apt: done in $(( $(date +%s) - APT_START ))s"
 fi
 
+# ethtool arms wake-on-LAN for the power schedule (agent v2.8). Best-effort on purpose: an
+# upgrade re-run at a site whose firewall blocks the Ubuntu mirrors must not die over it -
+# without ethtool the agent simply reports wolEnabled=false and the schedule still works
+# via the RTC alarm (or display-off fallback).
+if ! dpkg -s ethtool >/dev/null 2>&1; then
+  log "apt: installing ethtool (best-effort, for wake-on-LAN)..."
+  { apt-get "${APT_OPTS[@]}" -qq update && apt-get "${APT_OPTS[@]}" -q install --no-install-recommends ethtool; } \
+    || warn "ethtool unavailable - wake-on-LAN disabled on this screen (RTC/display-off sleep still works)"
+fi
+
 #--- Groups & X wrapper --------------------------------------------------------
 log "Configuring user groups and X permissions..."
 usermod -aG render,video "$KIOSK_USER"
