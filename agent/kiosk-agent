@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.8"
+AGENT_VERSION="2.9"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -247,11 +247,20 @@ apply_manager_key() {
   log "manager-key: installed v$ver for $KIOSK_USER (instant sync enabled)"
 }
 
-#--- Power schedule (v2.8) -----------------------------------------------------
-# config.json may carry .power {sleepTime "HH:MM", wakeTime "HH:MM", daysMask}.
-# daysMask bit N = day-of-week with Sunday=0 and marks the days the screen
-# WAKES; sleep fires daily at sleepTime, so a Mon-Fri mask sleeps Friday
+#--- Power schedule (v2.8, tz-aware since v2.9) --------------------------------
+# config.json may carry .power {sleepTime "HH:MM", wakeTime "HH:MM", daysMask,
+# timeZone}. daysMask bit N = day-of-week with Sunday=0 and marks the days the
+# screen WAKES; sleep fires daily at sleepTime, so a Mon-Fri mask sleeps Friday
 # evening through to Monday morning. Absent .power = never sleep.
+#
+# Schedule times are WALL-CLOCK in .power.timeZone (default Europe/London, the
+# fleet's zone) - the boxes' own clocks are UTC, which made v2.8 fire an hour
+# late during BST. Every wall-clock date computation goes through pdate.
+POWER_TZ="Europe/London"
+
+pdate() { # wall-clock date in the schedule's zone; blank POWER_TZ = the box's own clock
+  if [[ -n $POWER_TZ ]]; then TZ=$POWER_TZ date "$@"; else date "$@"; fi
+}
 
 hm_to_min() { # "HH:MM" -> minutes since midnight, or -1 when malformed
   [[ $1 =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || { echo -1; return; }
@@ -261,11 +270,11 @@ hm_to_min() { # "HH:MM" -> minutes since midnight, or -1 when malformed
 next_wake_epoch() { # next_wake_epoch WAKE_HHMM DAYSMASK -> epoch of the next scheduled wake
   local wake=$1 mask=$2 now base d target dow
   now=$(now_epoch)
-  base=$(date -d "@$now" +%F)
+  base=$(pdate -d "@$now" +%F)
   for d in 0 1 2 3 4 5 6 7; do
-    target=$(date -d "$base + $d day $wake" +%s 2>/dev/null) || return 1
+    target=$(pdate -d "$base + $d day $wake" +%s 2>/dev/null) || return 1
     (( target > now + 120 )) || continue   # meaningfully in the future (beyond the trigger window)
-    dow=$(date -d "@$target" +%w)          # 0=Sunday, matching the mask convention
+    dow=$(pdate -d "@$target" +%w)         # 0=Sunday, matching the mask convention
     (( (mask >> dow) & 1 )) && { echo "$target"; return 0; }
   done
   return 1   # empty mask - nothing would ever wake us
@@ -273,8 +282,8 @@ next_wake_epoch() { # next_wake_epoch WAKE_HHMM DAYSMASK -> epoch of the next sc
 
 # seams for the policy test harness - everything time-based derives from now_epoch
 now_epoch() { date +%s; }
-now_hm() { date -d "@$(now_epoch)" +%H:%M; }
-today_date() { date -d "@$(now_epoch)" +%F; }
+now_hm() { pdate -d "@$(now_epoch)" +%H:%M; }
+today_date() { pdate -d "@$(now_epoch)" +%F; }
 uptime_s() { awk '{print int($1)}' /proc/uptime; }
 power_off() { systemd-run --on-active=5 systemctl poweroff >/dev/null 2>&1 || systemctl poweroff; }
 rtc_arm() { rtcwake -m no -t "$1" >/dev/null 2>&1; }
@@ -284,12 +293,15 @@ display_start() { systemctl start kiosk-display; }
 check_power_schedule() {
   local cfg="$CONF_DIR/config.json"
   local sleep_t="" wake_t="" mask=0
+  local tz=""
   if [[ -r $cfg ]]; then
     sleep_t=$(jq -r '.power.sleepTime // empty' "$cfg" 2>/dev/null)
     wake_t=$(jq -r '.power.wakeTime // empty' "$cfg" 2>/dev/null)
     mask=$(jq -r '.power.daysMask // 0' "$cfg" 2>/dev/null)
+    tz=$(jq -r '.power.timeZone // empty' "$cfg" 2>/dev/null)
   fi
   [[ $mask =~ ^[0-9]+$ ]] || mask=0
+  [[ -n $tz ]] && POWER_TZ=$tz
 
   # display-off sleep in progress: resume at the stored wake time, or as soon
   # as the schedule is removed; never evaluate a new sleep while in it
@@ -328,13 +340,13 @@ check_power_schedule() {
   echo "$(today_date)" > "$CONF_DIR/last-sleep-date"
 
   if [[ $RTC_OK == true ]] && rtc_arm "$wake_epoch"; then
-    log "power: sleeping - RTC alarm armed for $(date -d "@$wake_epoch" '+%a %H:%M'), powering off"
+    log "power: sleeping - RTC alarm armed for $(pdate -d "@$wake_epoch" '+%a %H:%M'), powering off"
     power_off
   elif [[ $WOL_OK == true ]]; then
-    log "power: sleeping - no RTC alarm, relying on wake-on-LAN relay at $(date -d "@$wake_epoch" '+%a %H:%M'), powering off"
+    log "power: sleeping - no RTC alarm, relying on wake-on-LAN relay at $(pdate -d "@$wake_epoch" '+%a %H:%M'), powering off"
     power_off
   else
-    log "power: no RTC alarm and no wake-on-LAN - display-off sleep until $(date -d "@$wake_epoch" '+%a %H:%M')"
+    log "power: no RTC alarm and no wake-on-LAN - display-off sleep until $(pdate -d "@$wake_epoch" '+%a %H:%M')"
     echo "$wake_epoch" > "$CONF_DIR/display-sleep-until"
     display_stop
   fi
