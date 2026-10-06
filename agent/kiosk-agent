@@ -332,10 +332,12 @@ check_power_schedule() {
   sleep_min=$(hm_to_min "$sleep_t"); now_min=$(hm_to_min "$(now_hm)")
   (( sleep_min >= 0 && now_min >= 0 )) || return 0
 
-  # the trigger is a 2-minute window at the sleep time, once per day - a box
-  # powered on manually later in the sleep window therefore stays up
+  # the trigger is a 2-minute window at the sleep time, fired once per OCCURRENCE
+  # (date + sleep time) - so a box powered on manually later in the sleep window
+  # stays up, but editing the sleep time re-arms immediately (testability: the
+  # old per-day stamp swallowed every retest until midnight)
   (( now_min >= sleep_min && now_min < sleep_min + 2 )) || return 0
-  [[ $(cat "$CONF_DIR/last-sleep-date" 2>/dev/null) == "$(today_date)" ]] && return 0
+  [[ $(cat "$CONF_DIR/last-sleep-date" 2>/dev/null) == "$(today_date) $sleep_t" ]] && return 0
 
   # a recently booted box inside the window was woken on purpose - stay up
   if (( $(uptime_s) < 600 )); then
@@ -346,7 +348,7 @@ check_power_schedule() {
   local wake_epoch
   wake_epoch=$(next_wake_epoch "$wake_t" "$mask") || { log "power: no wake day in mask $mask - refusing to sleep"; return 0; }
 
-  echo "$(today_date)" > "$CONF_DIR/last-sleep-date"
+  echo "$(today_date) $sleep_t" > "$CONF_DIR/last-sleep-date"
 
   if [[ $RTC_OK == true ]] && rtc_arm "$wake_epoch"; then
     log "power: sleeping - RTC alarm armed for $(pdate -d "@$wake_epoch" '+%a %H:%M'), powering off"
