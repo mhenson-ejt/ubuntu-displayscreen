@@ -21,11 +21,26 @@
 set -uo pipefail
 
 CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
-PLACEHOLDER_DEFAULT=${KIOSK_PLACEHOLDER_DEFAULT:-/etc/kiosk/placeholder-default.html}
-PLACEHOLDER_UNREACHABLE=${KIOSK_PLACEHOLDER_UNREACHABLE:-/etc/kiosk/placeholder-unreachable.html}
 CHECK_INTERVAL=${KIOSK_WEBKIOSK_INTERVAL:-10}   # reachability + config poll cadence (seconds)
 
 say() { logger -t kiosk-webkiosk -- "$*" 2>/dev/null; echo "kiosk-webkiosk: $*" >&2; }
+
+# The placeholder pages are served over HTTP by the manager (the URL the agent already syncs with):
+# Chromium on Ubuntu is a confined SNAP and cannot read file:///etc/kiosk/*, so file:// placeholders
+# would silently fail. The local copies are a last resort only (manager URL somehow unset).
+_resolve_placeholders() {
+  local m=${MANAGER_URL%/}
+  if [[ -n $m ]]; then
+    PLACEHOLDER_DEFAULT_TARGET="$m/kiosk/placeholder/default"
+    PLACEHOLDER_UNREACHABLE_TARGET="$m/kiosk/placeholder/unreachable"
+  else
+    PLACEHOLDER_DEFAULT_TARGET="file://${KIOSK_PLACEHOLDER_DEFAULT:-/etc/kiosk/placeholder-default.html}"
+    PLACEHOLDER_UNREACHABLE_TARGET="file://${KIOSK_PLACEHOLDER_UNREACHABLE:-/etc/kiosk/placeholder-unreachable.html}"
+  fi
+}
+MANAGER_URL=""
+source /etc/kiosk/agent.env 2>/dev/null || true   # MANAGER_URL
+_resolve_placeholders
 
 chromium_bin() {
   local b
@@ -51,14 +66,14 @@ reachable() {
   curl -ksS -o /dev/null -m 8 "$u" 2>/dev/null
 }
 
-# choose_target -> the URL (or file:// placeholder) to show, given URL + reachability
+# choose_target -> the URL (or placeholder) to show, given URL + reachability
 choose_target() {
   if [[ -z ${URL:-} ]]; then
-    echo "file://$PLACEHOLDER_DEFAULT"
+    echo "$PLACEHOLDER_DEFAULT_TARGET"
   elif reachable "$URL"; then
     echo "$URL"
   else
-    echo "file://$PLACEHOLDER_UNREACHABLE"
+    echo "$PLACEHOLDER_UNREACHABLE_TARGET"
   fi
 }
 
@@ -73,10 +88,13 @@ launch_chromium() {   # launch_chromium TARGET -> sets CHROMIUM_PID
     return 0
   fi
 
+  # --disable-gpu + friends: these NUCs run a bare X on old Intel graphics, where the GPU process
+  # often crashes to a black window; software rendering is plenty for a web page and far more
+  # reliable. --disable-dev-shm-usage avoids crashes on the small default /dev/shm.
   "$bin" --kiosk --incognito --noerrdialogs --disable-infobars \
     --disable-session-crashed-bubble --disable-features=TranslateUI --no-first-run \
     --disable-pinch --overscroll-history-navigation=0 --check-for-update-interval=31536000 \
-    --password-store=basic --app="$target" >/dev/null 2>&1 &
+    --password-store=basic --disable-gpu --disable-dev-shm-usage --app="$target" >/dev/null 2>&1 &
   CHROMIUM_PID=$!
   say "showing $target (chromium pid $CHROMIUM_PID)"
 }
