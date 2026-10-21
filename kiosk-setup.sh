@@ -434,9 +434,14 @@ EOF
   systemctl daemon-reload
   systemctl disable getty@tty1.service 2>/dev/null || true
   systemctl enable kiosk-agent kiosk-display
-  # restart (not enable --now): on upgrade re-runs the services are already
-  # running old code and must pick up the freshly installed files
-  systemctl restart kiosk-agent kiosk-display
+  # Restart (not enable --now): on upgrade re-runs the services are already running old code and must
+  # pick up the freshly installed files. kiosk-agent FIRST and on its own line, so the new binary is
+  # definitely live. The display restart can be SUPERSEDED by the new agent's own restart when it
+  # applies a screen-type change on its first poll (systemd prints "Job for kiosk-display.service
+  # canceled" and returns non-zero) - that is harmless, so it must never trip the ERR trap and abort
+  # the rest of the installer (which is what left agents stuck on the old version).
+  systemctl restart kiosk-agent
+  systemctl restart kiosk-display || true
 
   log "Waiting for registration with the manager (up to 60s)..."
   REGISTERED=""
