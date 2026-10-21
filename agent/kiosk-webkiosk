@@ -75,12 +75,27 @@ start_wm() {
   sleep 1
 }
 
-# read_cfg -> sets SCREEN_TYPE, URL, REFRESH from config.json
+# read_cfg -> SCREEN_TYPE, REFRESH, and the ordered page arrays URLS[]/DWELLS[] (+ NPAGES). Pages are
+# read by index (not jq's `.[]`), so the tiny test-harness jq shim - which has no array iteration -
+# can drive it; real jq on the screen handles either. URL keeps the first page for choose_target.
 read_cfg() {
   SCREEN_TYPE=$(jq -r '.screenType // 1' "$CONFIG" 2>/dev/null || echo 1)
-  URL=$(jq -r '.webKiosk.pages[0].url // empty' "$CONFIG" 2>/dev/null || true)
   REFRESH=$(jq -r '.webKiosk.refreshSeconds // empty' "$CONFIG" 2>/dev/null || true)
   [[ $REFRESH =~ ^[0-9]+$ ]] || REFRESH=""
+
+  URLS=(); DWELLS=()
+  local i=0 u d
+  while :; do
+    u=$(jq -r ".webKiosk.pages[$i].url // empty" "$CONFIG" 2>/dev/null || true)
+    [[ -z $u ]] && break
+    URLS+=("$u")
+    d=$(jq -r ".webKiosk.pages[$i].dwellSeconds // 30" "$CONFIG" 2>/dev/null || echo 30)
+    { [[ $d =~ ^[0-9]+$ ]] && (( d >= 5 )); } || d=30
+    DWELLS+=("$d")
+    i=$((i + 1))
+  done
+  NPAGES=${#URLS[@]}
+  URL=${URLS[0]:-}
 }
 
 # reachable URL -> 0 if the page responds (HEAD, then GET for servers that refuse HEAD)
@@ -91,21 +106,32 @@ reachable() {
   curl -ksS -o /dev/null -m 8 "$u" 2>/dev/null
 }
 
-# choose_target -> the URL (or placeholder) to show, given URL + reachability
-choose_target() {
-  if [[ -z ${URL:-} ]]; then
+# target_at INDEX -> the URL (or a placeholder) to show for page INDEX, given reachability. No pages
+# at all -> the default placeholder; an unreachable page -> the unreachable placeholder (rotation
+# still advances past it, and it is re-checked each time it comes round).
+target_at() {
+  local idx=$1 u
+  if (( NPAGES == 0 )); then
     echo "$PLACEHOLDER_DEFAULT_TARGET"
-  elif reachable "$URL"; then
-    echo "$URL"
+    return
+  fi
+  u=${URLS[$idx]}
+  if reachable "$u"; then
+    echo "$u"
   else
     echo "$PLACEHOLDER_UNREACHABLE_TARGET"
   fi
 }
 
-launch_browser() {   # launch_browser TARGET -> sets BROWSER_PID (and BROWSER_WID for Falkon)
+# choose_target -> target for the first/only page (single-URL path; used by the supervise loop when a
+# kiosk has one page, and by the test harness).
+choose_target() { target_at 0; }
+
+launch_browser() {   # launch_browser TARGET -> sets BROWSER_PID, BROWSER_KIND (and BROWSER_WID for Falkon)
   local target=$1 bin
   bin=$(browser_bin)
   if [[ -z $bin ]]; then say "no browser installed (falkon/chromium) - cannot show web kiosk"; return 1; fi
+  BROWSER_KIND=$bin
 
   if [[ -n ${KIOSK_DRYRUN:-} ]]; then
     echo "browser: $bin $target"
@@ -120,12 +146,30 @@ launch_browser() {   # launch_browser TARGET -> sets BROWSER_PID (and BROWSER_WI
   esac
 }
 
+# navigate TARGET -> point the ALREADY-RUNNING browser at a new URL, no relaunch (so rotation and
+# reachability changes don't flash). Falkon's single-instance remote does this via --current-tab;
+# a plain Chromium has no simple remote, so there we relaunch.
+navigate() {
+  local target=$1
+  if [[ -n ${KIOSK_DRYRUN:-} ]]; then
+    echo "navigate: $target"
+    return 0
+  fi
+  if [[ ${BROWSER_KIND:-} == falkon ]]; then
+    falkon --profile kiosk --current-tab "$target" >/dev/null 2>&1 &
+  else
+    kill "$BROWSER_PID" 2>/dev/null || true
+    wait "$BROWSER_PID" 2>/dev/null || true
+    _launch_chromium "${BROWSER_KIND:-chromium}" "$target"
+  fi
+}
+
 _launch_falkon() {   # Falkon in a dedicated profile, forced full-screen with xdotool
   local target=$1 dims w h wid
-  # Dedicated profile -> no first-run wizard, no session-restore prompt; --no-remote -> this process
-  # owns the window (a second falkon can't steal the tab). URL passed positionally (works on every
-  # Falkon version).
-  falkon --no-remote --profile kiosk "$target" >/dev/null 2>&1 &
+  # Dedicated profile -> no first-run wizard, no session-restore prompt. NO --no-remote: rotation
+  # navigates this instance with `falkon --current-tab <url>`, which only works when the first launch
+  # left the remote socket open. URL passed positionally (works on every Falkon version).
+  falkon --profile kiosk "$target" >/dev/null 2>&1 &
   BROWSER_PID=$!
   say "showing $target (falkon pid $BROWSER_PID)"
 
@@ -180,56 +224,81 @@ refresh_page() {   # send a reload (F5) to the kiosk window
 say "web kiosk display loop starting (config $CONFIG)"
 start_wm   # maximise the browser window on the bare, WM-less X
 
+TICK=${KIOSK_WEBKIOSK_TICK:-5}   # supervise cadence; also the dwell/refresh granularity
+
+read_cfg
+cur=0
+cfg_sig=$(md5sum "$CONFIG" 2>/dev/null | awk '{print $1}')
+
+# Initial launch. Retry (showing nothing) until a browser is present - the agent installs Falkon when
+# a screen becomes a web kiosk, so this covers the gap before that finishes.
+target=$(target_at "$cur")
+until launch_browser "$target"; do
+  sleep "$CHECK_INTERVAL"
+  read_cfg
+  [[ $SCREEN_TYPE != 2 ]] && { say "no longer web kiosk - exiting"; exit 0; }
+  target=$(target_at "$cur")
+done
+shown=$target
+now=$(date +%s); page_since=$now; last_refresh=$now
+
 while true; do
+  sleep "$TICK"
+  [[ -n ${KIOSK_DRYRUN:-} ]] && break
+
+  # Browser gone (crash, killed)? Relaunch at the current page.
+  if ! kill -0 "$BROWSER_PID" 2>/dev/null; then
+    say "browser exited - relaunching"
+    target=$(target_at "$cur")
+    launch_browser "$target" || { sleep "$CHECK_INTERVAL"; continue; }
+    shown=$target; now=$(date +%s); page_since=$now; last_refresh=$now
+    continue
+  fi
+
   read_cfg
   if [[ $SCREEN_TYPE != 2 ]]; then
-    say "screen type is no longer web kiosk - exiting so the display switches"
+    kill "$BROWSER_PID" 2>/dev/null || true
+    say "switched away from web kiosk - exiting"
     exit 0
   fi
 
-  target=$(choose_target)
-  cfg_sig=$(md5sum "$CONFIG" 2>/dev/null | awk '{print $1}')
+  now=$(date +%s)
 
-  if ! launch_browser "$target"; then
-    sleep "$CHECK_INTERVAL"
+  # Config changed centrally: restart the rotation from the first page with the new list.
+  new_sig=$(md5sum "$CONFIG" 2>/dev/null | awk '{print $1}')
+  if [[ $new_sig != "$cfg_sig" ]]; then
+    say "config changed - reloading pages"
+    cfg_sig=$new_sig
+    cur=0
+    target=$(target_at "$cur")
+    [[ $target != "$shown" ]] && { navigate "$target"; shown=$target; }
+    page_since=$now; last_refresh=$now
     continue
   fi
-  shown=$target
-  last_refresh=$(date +%s)
 
-  # supervise: keep it up, apply refresh, react to reachability / config / type changes
-  while [[ ${KIOSK_DRYRUN:-} ]] || kill -0 "$BROWSER_PID" 2>/dev/null; do
-    sleep "$CHECK_INTERVAL"
-    [[ -n ${KIOSK_DRYRUN:-} ]] && break
-
-    read_cfg
-    if [[ $SCREEN_TYPE != 2 ]]; then
-      kill "$BROWSER_PID" 2>/dev/null || true
-      say "switched away from web kiosk - exiting"
-      exit 0
+  # Rotation: advance to the next page once the current page's dwell has elapsed (2+ pages only).
+  if (( NPAGES >= 2 )); then
+    dwell=${DWELLS[$cur]:-30}
+    if (( now - page_since >= dwell )); then
+      cur=$(( (cur + 1) % NPAGES ))
+      target=$(target_at "$cur")
+      navigate "$target"; shown=$target
+      page_since=$now; last_refresh=$now
+      continue
     fi
+  fi
 
-    new_sig=$(md5sum "$CONFIG" 2>/dev/null | awk '{print $1}')
-    if [[ $new_sig != "$cfg_sig" ]]; then
-      say "config changed - reloading"
-      break
-    fi
+  # Reachability of the page currently shown changed (recovered, or just went down): re-point without
+  # resetting the dwell clock, so a flapping page doesn't stall the rotation.
+  desired=$(target_at "$cur")
+  if [[ $desired != "$shown" ]]; then
+    say "target changed ($shown -> $desired)"
+    navigate "$desired"; shown=$desired; last_refresh=$now
+  fi
 
-    desired=$(choose_target)
-    if [[ $desired != "$shown" ]]; then
-      say "target changed ($shown -> $desired) - reloading"
-      break
-    fi
-
-    if [[ -n ${REFRESH:-} && $shown == "$URL" ]]; then
-      now=$(date +%s)
-      if (( now - last_refresh >= REFRESH )); then
-        refresh_page
-        last_refresh=$now
-      fi
-    fi
-  done
-
-  kill "$BROWSER_PID" 2>/dev/null || true
-  wait "$BROWSER_PID" 2>/dev/null || true
+  # Periodic reload of a real page (data that doesn't refresh itself); mainly the single-page case.
+  if [[ -n ${REFRESH:-} && $shown == http* ]] && (( now - last_refresh >= REFRESH )); then
+    refresh_page
+    last_refresh=$now
+  fi
 done
