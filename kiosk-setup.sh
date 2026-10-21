@@ -264,10 +264,16 @@ fi
 
 #--- /etc/kiosk base -----------------------------------------------------------
 mkdir -p /etc/kiosk
+# kiosk.conf holds no secrets and is readable by the kiosk user (unlike agent.env, which is 600 root
+# because it carries the API token). webkiosk.sh runs AS the kiosk user and reads MANAGER_URL from
+# here to build the HTTP placeholder URLs - without it, it would fall back to file:///etc/kiosk/*,
+# which the kiosk user can't open ("access denied").
 cat > /etc/kiosk/kiosk.conf <<EOF
 KIOSK_USER=$KIOSK_USER
 KIOSK_HOME=$KIOSK_HOME
+MANAGER_URL=$MANAGER_URL
 EOF
+chmod 644 /etc/kiosk/kiosk.conf
 
 log "Installing display loop and display service..."
 # cams.sh re-reads /etc/kiosk/config.json on every mpv respawn, so config

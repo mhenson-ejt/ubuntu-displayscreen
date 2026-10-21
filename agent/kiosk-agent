@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.12"
+AGENT_VERSION="2.13"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -143,22 +143,25 @@ build_status() {
           rtcWakeSupported:$rtc, wolMac:(if $wm == "" then null else $wm end), wolEnabled:$we}'
 }
 
-# Install a browser for the Web kiosk screen type. Falkon is QtWebEngine (Chromium's Blink engine)
-# and a plain .deb from the Ubuntu archive - no snap, so it can never hang the way 'snap install
+# Install what a Web kiosk screen needs: a browser (Falkon = QtWebEngine, Chromium's Blink engine)
+# and a tiny window manager (matchbox) that maximises the single browser window to fill the screen -
+# the boxes run a bare X with no WM, so a browser otherwise opens as a small un-maximised window.
+# Both are plain .debs from the Ubuntu archive - no snap, so neither can hang the way 'snap install
 # chromium' does when the snap store is unreachable. Bounded by `timeout` so even a slow mirror can
-# only delay, never wedge, the agent. A no-op once a browser is present.
+# only delay, never wedge, the agent. A no-op once everything is present.
 ensure_webkiosk_browser() {
-  local b
-  for b in falkon chromium chromium-browser; do
-    command -v "$b" >/dev/null 2>&1 && return 0
-  done
-  log "web kiosk: installing falkon (real .deb from the Ubuntu archive, no snap)..."
+  local need=()
+  command -v falkon >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1 \
+    || command -v chromium-browser >/dev/null 2>&1 || need+=(falkon)
+  command -v matchbox-window-manager >/dev/null 2>&1 || need+=(matchbox-window-manager)
+  [[ ${#need[@]} -eq 0 ]] && return 0
+  log "web kiosk: installing ${need[*]} (real .deb(s) from the Ubuntu archive, no snap)..."
   if DEBIAN_FRONTEND=noninteractive timeout 480 sh -c \
-       'apt-get -o Acquire::Retries=2 -qq update && apt-get -o Acquire::Retries=2 -y install --no-install-recommends falkon' \
-       >/dev/null 2>&1 && command -v falkon >/dev/null 2>&1; then
-    log "web kiosk: falkon installed"
+       "apt-get -o Acquire::Retries=2 -qq update && apt-get -o Acquire::Retries=2 -y install --no-install-recommends ${need[*]}" \
+       >/dev/null 2>&1; then
+    log "web kiosk: installed ${need[*]}"
   else
-    log "web kiosk: falkon not available yet - will retry on the next apply (screen shows a placeholder meanwhile)"
+    log "web kiosk: install of ${need[*]} failed/timed out - will retry on the next apply (placeholder meanwhile)"
   fi
 }
 

@@ -41,7 +41,9 @@ _resolve_placeholders() {
   fi
 }
 MANAGER_URL=""
-source /etc/kiosk/agent.env 2>/dev/null || true   # MANAGER_URL
+# kiosk.conf is the viewer-readable base file (agent.env is 600 root - we run as the kiosk user and
+# can't read it, which left MANAGER_URL empty and forced the unreadable file:// placeholder fallback).
+source /etc/kiosk/kiosk.conf 2>/dev/null || true   # MANAGER_URL (+ KIOSK_USER/HOME)
 _resolve_placeholders
 
 # Preferred browser: Falkon (QtWebEngine = Chromium engine, a .deb from the archive). Chromium next,
@@ -59,6 +61,18 @@ screen_dims() {
   local d
   d=$(xrandr 2>/dev/null | awk '/current/{sub(",", "", $10); print $8, $10; exit}')
   [[ $d =~ ^[0-9]+\ +[0-9]+$ ]] && echo "$d" || echo "1920 1080"
+}
+
+# start_wm -> run a tiny window manager so the browser window fills the screen. The boxes run a bare
+# X with no WM, so a browser otherwise opens as a small, un-maximised window. matchbox maximises the
+# single top-level app window to the whole screen and draws no titlebar/cursor - the standard kiosk
+# WM. The camera wall doesn't use it (mpv places its own borderless windows). No-op if absent or
+# already running.
+start_wm() {
+  command -v matchbox-window-manager >/dev/null 2>&1 || { say "matchbox not installed - window may not fill the screen"; return 0; }
+  pgrep -x matchbox-window-manager >/dev/null 2>&1 && return 0
+  matchbox-window-manager -use_titlebar no -use_cursor no >/dev/null 2>&1 &
+  sleep 1
 }
 
 # read_cfg -> sets SCREEN_TYPE, URL, REFRESH from config.json
@@ -164,6 +178,7 @@ refresh_page() {   # send a reload (F5) to the kiosk window
 [[ -n ${KIOSK_WEBKIOSK_TEST:-} ]] && return 0
 
 say "web kiosk display loop starting (config $CONFIG)"
+start_wm   # maximise the browser window on the bare, WM-less X
 
 while true; do
   read_cfg
