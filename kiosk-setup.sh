@@ -226,16 +226,20 @@ if ! dpkg -s ethtool >/dev/null 2>&1; then
     || warn "ethtool unavailable - wake-on-LAN disabled on this screen (RTC/display-off sleep still works)"
 fi
 
-# Chromium + xdotool power the Web kiosk screen type (agent v2.11): Chromium renders the page in
-# kiosk mode, xdotool sends the periodic refresh. Best-effort like ethtool - a camera-wall screen
-# never needs them, and a mirror-blocked site keeps self-updating; a web-kiosk screen without
-# Chromium just logs and shows nothing until it is installed. chromium-browser is a snap shim on
-# recent Ubuntu, which is fine for a plain --kiosk --app window.
-if ! command -v chromium-browser >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1; then
-  log "apt: installing chromium + xdotool (best-effort, for web kiosk screens)..."
-  { apt-get "${APT_OPTS[@]}" -qq update && apt-get "${APT_OPTS[@]}" -q install --no-install-recommends chromium-browser xdotool; } \
-    || warn "chromium unavailable - web kiosk screens will not render until it is installed (camera walls unaffected)"
+# xdotool drives the periodic refresh on web kiosk screens. It is a small real .deb from the Ubuntu
+# archive, so it installs cleanly - best-effort like ethtool.
+if ! command -v xdotool >/dev/null 2>&1; then
+  log "apt: installing xdotool (best-effort, for web kiosk refresh)..."
+  { apt-get "${APT_OPTS[@]}" -qq update && apt-get "${APT_OPTS[@]}" -q install --no-install-recommends xdotool; } \
+    || warn "xdotool unavailable - web kiosk auto-refresh disabled (camera walls unaffected)"
 fi
+
+# IMPORTANT: the web-kiosk BROWSER is deliberately NOT auto-installed here. On Ubuntu 24.04
+# 'chromium-browser' is only a snap shim: its postinst runs 'snap install chromium', which on a
+# screen that can't reach the snap store retries for 30 MINUTES and wedges this agent self-update
+# (dpkg left half-configured). A web-kiosk screen gets its browser installed as a separate,
+# deliberate step; a camera-wall screen never needs one. webkiosk.sh uses whatever 'chromium' or
+# 'chromium-browser' binary is present and logs clearly when none is.
 
 #--- Groups & X wrapper --------------------------------------------------------
 log "Configuring user groups and X permissions..."
