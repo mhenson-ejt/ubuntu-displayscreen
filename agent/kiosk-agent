@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.10"
+AGENT_VERSION="2.11"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -180,11 +180,24 @@ apply_config() {
     fi
   fi
 
-  # Reload the stream only: kill mpv and let the cams.sh loop respawn it with
-  # the new config. X keeps running - no black flash, ~3-5 s to new video.
-  pkill -u "$KIOSK_USER" -x mpv 2>/dev/null || true
+  # Screen TYPE change (camera wall <-> web kiosk, v2.11+) means a different renderer, so restart
+  # the display service: kiosk-display re-runs cams.sh, which re-branches to the wall or webkiosk.sh.
+  local new_type old_type
+  new_type=$(jq -r '.screenType // 1' "$CONF_DIR/config.json" 2>/dev/null || echo 1)
+  old_type=$(cat "$CONF_DIR/applied-screen-type" 2>/dev/null || echo 1)
+  echo "$new_type" > "$CONF_DIR/applied-screen-type"
   echo "$ver" > "$CONF_DIR/applied-config-version"
-  log "config: applied v$ver (stream reloading)"
+
+  if [[ $new_type != "$old_type" ]]; then
+    log "config: applied v$ver (screen type $old_type -> $new_type, restarting display)"
+    systemctl restart kiosk-display
+    return 0
+  fi
+
+  # Same type. A web kiosk's webkiosk.sh polls config.json itself and reloads; the camera wall
+  # reloads when mpv is killed (cams.sh respawns it). X keeps running - no black flash either way.
+  [[ $new_type == 1 ]] && pkill -u "$KIOSK_USER" -x mpv 2>/dev/null || true
+  log "config: applied v$ver (reloading)"
 }
 
 apply_keys() {

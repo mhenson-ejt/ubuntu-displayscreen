@@ -226,6 +226,17 @@ if ! dpkg -s ethtool >/dev/null 2>&1; then
     || warn "ethtool unavailable - wake-on-LAN disabled on this screen (RTC/display-off sleep still works)"
 fi
 
+# Chromium + xdotool power the Web kiosk screen type (agent v2.11): Chromium renders the page in
+# kiosk mode, xdotool sends the periodic refresh. Best-effort like ethtool - a camera-wall screen
+# never needs them, and a mirror-blocked site keeps self-updating; a web-kiosk screen without
+# Chromium just logs and shows nothing until it is installed. chromium-browser is a snap shim on
+# recent Ubuntu, which is fine for a plain --kiosk --app window.
+if ! command -v chromium-browser >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1; then
+  log "apt: installing chromium + xdotool (best-effort, for web kiosk screens)..."
+  { apt-get "${APT_OPTS[@]}" -qq update && apt-get "${APT_OPTS[@]}" -q install --no-install-recommends chromium-browser xdotool; } \
+    || warn "chromium unavailable - web kiosk screens will not render until it is installed (camera walls unaffected)"
+fi
+
 #--- Groups & X wrapper --------------------------------------------------------
 log "Configuring user groups and X permissions..."
 usermod -aG render,video "$KIOSK_USER"
@@ -260,6 +271,12 @@ log "Installing display loop and display service..."
 # but only root and the kiosk user get to run it.
 fetch_file agent/kiosk-cams /etc/kiosk/cams.sh 750
 chown "root:$KIOSK_USER" /etc/kiosk/cams.sh
+# Web kiosk renderer + placeholders (agent v2.11): cams.sh execs webkiosk.sh when the screen type is
+# Web kiosk. The placeholders are shown when nothing is configured / the page can't be reached.
+fetch_file agent/kiosk-webkiosk /etc/kiosk/webkiosk.sh 750
+chown "root:$KIOSK_USER" /etc/kiosk/webkiosk.sh
+fetch_file agent/placeholder-default.html /etc/kiosk/placeholder-default.html 644
+fetch_file agent/placeholder-unreachable.html /etc/kiosk/placeholder-unreachable.html 644
 fetch_file agent/kiosk-display.service /etc/systemd/system/kiosk-display.service 644
 sed -i "s/@KIOSK_USER@/$KIOSK_USER/" /etc/systemd/system/kiosk-display.service
 

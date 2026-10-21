@@ -65,6 +65,15 @@ RUN_DIR=${KIOSK_RUN_DIR:-/tmp}
 # logger, not stderr: startx swallows the X clients' stderr, so journald never saw these
 say() { logger -t kiosk-cams -- "$*" 2>/dev/null; echo "kiosk-cams: $*" >&2; }
 
+# Branch on screen type (v2.11+): a Web kiosk (screenType 2) shows a web page via webkiosk.sh
+# instead of the camera wall. webkiosk.sh exits if the type changes back, and because the agent
+# restarts kiosk-display on a type change, this script re-runs and re-branches. Older configs with
+# no screenType default to 1 (camera wall), so camera screens are unaffected.
+if [[ "$(jq -r '.screenType // 1' "$CONFIG" 2>/dev/null || echo 1)" == 2 ]] && [[ -x /etc/kiosk/webkiosk.sh ]]; then
+  say "screen type is web kiosk - handing off to webkiosk.sh"
+  exec /etc/kiosk/webkiosk.sh
+fi
+
 # TCP probe so an unreachable NVR shows a black cell that keeps retrying,
 # instead of mpv burning a connect timeout every couple of seconds
 reachable() { # reachable IP PORT

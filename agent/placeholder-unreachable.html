@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Page unavailable</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{background:#0e1320;color:#e6e9f0;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;
+       display:flex;align-items:center;justify-content:center;text-align:center}
+  .box{max-width:48rem;padding:2rem}
+  .dot{display:inline-block;width:.7rem;height:.7rem;border-radius:50%;background:#e0a34a;
+       box-shadow:0 0 10px #e0a34a;margin-right:.5rem;vertical-align:middle}
+  h1{font-size:2.4rem;font-weight:600;margin:.2rem 0 1rem}
+  p{font-size:1.2rem;color:#9aa4b8;margin:.3rem 0}
+  .brand{font-size:1rem;letter-spacing:.08em;text-transform:uppercase;color:#6b768c;margin-bottom:1.5rem}
+  .spin{margin-top:1.4rem;width:2rem;height:2rem;border:3px solid #2a3346;border-top-color:#e0a34a;
+        border-radius:50%;display:inline-block;animation:s 1s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="brand"><span class="dot"></span>Display Screens</div>
+    <h1>Can't reach the page right now</h1>
+    <p>The page this screen should show isn't responding.</p>
+    <p>It will reappear automatically as soon as it's back.</p>
+    <div class="spin"></div>
+  </div>
+</body>
+</html>
