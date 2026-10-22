@@ -31,7 +31,8 @@ STATE_DIR="$RUN_DIR/maint"
 CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
 PROFILE=kiosk                                   # the SHARED Falkon profile the live kiosk uses
 HIDDEN_DISPLAY=${KIOSK_MAINT_DISPLAY:-:20}      # hidden Xvfb display (far from :0)
-VNC_PORT=${KIOSK_MAINT_VNC_PORT:-5900}
+VNC_PORT=${KIOSK_MAINT_VNC_PORT:-5900}          # x11vnc, bound to localhost (only the web port is LAN-exposed)
+WEB_PORT=${KIOSK_MAINT_WEB_PORT:-6080}          # websockify + noVNC - the admin opens this in a browser
 MAX_MINUTES=${KIOSK_MAINT_MAX_MINUTES:-30}      # hard cap - tear down no matter what
 SELF=/usr/local/sbin/kiosk-maintenance
 
@@ -55,6 +56,8 @@ ensure_deps() {
   command -v x11vnc >/dev/null 2>&1 || need+=(x11vnc)
   command -v matchbox-window-manager >/dev/null 2>&1 || need+=(matchbox-window-manager)
   command -v falkon >/dev/null 2>&1 || need+=(falkon)
+  command -v websockify >/dev/null 2>&1 || need+=(websockify)   # web VNC (noVNC in a browser)
+  [[ -d /usr/share/novnc ]] || need+=(novnc)
   [[ ${#need[@]} -eq 0 ]] && return 0
   say "installing ${need[*]} (archive .debs, no snap)..."
   DEBIAN_FRONTEND=noninteractive timeout 480 sh -c \
@@ -105,27 +108,35 @@ start() {
   as_user_x "$HIDDEN_DISPLAY" falkon --profile "$PROFILE" "$url" >/dev/null 2>&1 &
   echo $! > "$STATE_DIR/falkon.pid"
 
-  # 4) one-time VNC password; serve the hidden display on the LAN
+  # 4) one-time VNC password; x11vnc on LOCALHOST only (only the web port is LAN-exposed)
   local pw pwfile; pw=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
   pwfile="$STATE_DIR/vnc.pass"
   x11vnc -storepasswd "$pw" "$pwfile" >/dev/null 2>&1
-  say "serving hidden display over VNC on port $VNC_PORT"
-  x11vnc -display "$HIDDEN_DISPLAY" -rfbport "$VNC_PORT" -rfbauth "$pwfile" \
-         -forever -shared -noxdamage -timeout 120 -bg >/dev/null 2>&1
+  say "serving hidden display over VNC (localhost:$VNC_PORT)"
+  x11vnc -display "$HIDDEN_DISPLAY" -rfbport "$VNC_PORT" -localhost -rfbauth "$pwfile" \
+         -forever -shared -noxdamage -timeout "$(( MAX_MINUTES * 60 ))" -bg >/dev/null 2>&1
 
-  # 5) hard cap: auto-exit after MAX_MINUTES regardless
+  # 5) websockify + noVNC: the admin opens this in a browser, no VNC client needed. Serves the noVNC
+  #    web app on WEB_PORT and bridges WebSocket <-> x11vnc on localhost.
+  say "serving noVNC web client on port $WEB_PORT"
+  websockify -D --web=/usr/share/novnc "$WEB_PORT" "localhost:$VNC_PORT" >/dev/null 2>&1 \
+    || say "websockify failed to start - web VNC unavailable (raw VNC on localhost still up)"
+
+  # 6) hard cap: auto-exit after MAX_MINUTES regardless
   ( sleep $(( MAX_MINUTES * 60 )); [[ -e $MAINT_FLAG ]] && "$SELF" off ) >/dev/null 2>&1 &
   echo $! > "$STATE_DIR/watchdog.pid"
 
-  local ip; ip=$(lan_ip)
-  say "MAINTENANCE READY  vnc=${ip:-<screen-ip>}:$VNC_PORT  password=$pw  expires=${MAX_MINUTES}m  url=$url"
+  local ip weburl; ip=$(lan_ip)
+  weburl="http://${ip:-SCREEN-IP}:$WEB_PORT/vnc.html?autoconnect=true&password=$pw"
+  say "MAINTENANCE READY  open: $weburl   (expires ${MAX_MINUTES}m, url=$url)"
   # machine-readable last line for the agent to relay to the manager
-  echo "VNC ${ip:-unknown} $VNC_PORT $pw $MAX_MINUTES"
+  echo "WEBVNC $weburl $MAX_MINUTES"
 }
 
 stop() {
   say "stopping maintenance"
   [[ -f $STATE_DIR/watchdog.pid ]] && kill "$(cat "$STATE_DIR/watchdog.pid")" 2>/dev/null || true
+  pkill -f "websockify.*$WEB_PORT" 2>/dev/null || true
   pkill -f "x11vnc.*-rfbport $VNC_PORT" 2>/dev/null || true
   local p
   for p in falkon mbox xvfb; do
@@ -135,6 +146,11 @@ stop() {
   rm -rf "$STATE_DIR"
   say "maintenance ended - kiosk resuming (authenticated from the shared profile)"
 }
+
+if [[ $EUID -ne 0 ]]; then
+  echo "kiosk-maintenance must run as root (installs packages, manages displays). Try: sudo kiosk-maintenance $*" >&2
+  exit 1
+fi
 
 case "${1:-}" in
   on)  shift; start "${1:-}";;

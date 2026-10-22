@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.15"
+AGENT_VERSION="2.16"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -154,10 +154,12 @@ ensure_webkiosk_browser() {
   command -v falkon >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1 \
     || command -v chromium-browser >/dev/null 2>&1 || need+=(falkon)
   command -v matchbox-window-manager >/dev/null 2>&1 || need+=(matchbox-window-manager)
-  # Maintenance-login deps (hidden display + VNC) - front-loaded here so the first maintenance-on is
-  # instant rather than blocking the agent on an apt install.
+  # Maintenance-login deps (hidden display + web VNC) - front-loaded here so the first maintenance-on
+  # is instant rather than blocking the agent on an apt install.
   command -v Xvfb >/dev/null 2>&1 || need+=(xvfb)
   command -v x11vnc >/dev/null 2>&1 || need+=(x11vnc)
+  command -v websockify >/dev/null 2>&1 || need+=(websockify)
+  [[ -d /usr/share/novnc ]] || need+=(novnc)
   [[ ${#need[@]} -eq 0 ]] && return 0
   log "web kiosk: installing ${need[*]} (real .deb(s) from the Ubuntu archive, no snap)..."
   if DEBIAN_FRONTEND=noninteractive timeout 480 sh -c \
@@ -463,7 +465,7 @@ handle_command() {
       # connect. The password is one-time and the session self-expires.
       if command -v kiosk-maintenance >/dev/null 2>&1; then
         local vnc
-        vnc=$(kiosk-maintenance on 2>/dev/null | grep '^VNC ' | tail -1)
+        vnc=$(kiosk-maintenance on 2>/dev/null | grep '^WEBVNC ' | tail -1)
         if [[ -n $vnc ]]; then ack "$id" ok "$vnc"
         else ack "$id" error "maintenance start failed (see journalctl -t kiosk-maintenance)"; fi
       else
