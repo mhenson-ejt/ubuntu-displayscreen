@@ -32,6 +32,11 @@ MAINT_DIR=${KIOSK_RUN_DIR:-/run/kiosk}
 MAINT_FLAG="$MAINT_DIR/maintenance"
 MAINT_YIELDED="$MAINT_DIR/maintenance-yielded"
 
+# Chromium's persistent profile - SHARED with the maintenance-login session so a login done there
+# carries over to the live screen. The placeholder uses a throwaway copy ("-maint") so it never locks
+# the shared one.
+KIOSK_CHROMIUM_DIR=${KIOSK_CHROMIUM_DIR:-$HOME/.config/kiosk-chromium}
+
 say() { logger -t kiosk-webkiosk -- "$*" 2>/dev/null; echo "kiosk-webkiosk: $*" >&2; }
 
 # The placeholder pages are served over HTTP by the manager (the URL the agent already syncs with) so
@@ -53,11 +58,11 @@ MANAGER_URL=""
 source /etc/kiosk/kiosk.conf 2>/dev/null || true   # MANAGER_URL (+ KIOSK_USER/HOME)
 _resolve_placeholders
 
-# Preferred browser: Falkon (QtWebEngine = Chromium engine, a .deb from the archive). Chromium next,
-# only if a real (non-snap) one happens to be installed.
+# Preferred browser: real Chromium (current engine from the xtradeb PPA - modern sites like claude.ai
+# reject the archive's 2020-era Falkon). Falkon is only a last-resort fallback now.
 browser_bin() {
   local b
-  for b in falkon chromium chromium-browser; do
+  for b in chromium chromium-browser falkon; do
     command -v "$b" >/dev/null 2>&1 && { echo "$b"; return 0; }
   done
   echo ""
@@ -206,13 +211,15 @@ _launch_falkon() {   # Falkon in a dedicated profile, forced full-screen with xd
 
 _launch_chromium() {   # _launch_chromium BIN TARGET
   local bin=$1 target=$2
-  # --disable-gpu + friends: these NUCs run a bare X on old Intel graphics, where the GPU process
-  # often crashes to a black window; software rendering is plenty for a web page and far more
-  # reliable. --disable-dev-shm-usage avoids crashes on the small default /dev/shm.
-  "$bin" --kiosk --incognito --noerrdialogs --disable-infobars \
-    --disable-session-crashed-bubble --disable-features=TranslateUI --no-first-run \
-    --disable-pinch --overscroll-history-navigation=0 --check-for-update-interval=31536000 \
-    --password-store=basic --disable-gpu --disable-dev-shm-usage --app="$target" >/dev/null 2>&1 &
+  # NOT --incognito: the kiosk keeps a persistent profile so logins (done in a maintenance session on
+  # the same --user-data-dir) stick. --disable-gpu + friends: these NUCs run a bare X on old Intel
+  # graphics where the GPU process often crashes to a black window; software rendering is plenty and
+  # far more reliable. --disable-dev-shm-usage avoids crashes on the small default /dev/shm.
+  rm -f "$KIOSK_CHROMIUM_DIR/SingletonLock" 2>/dev/null || true   # clear a stale lock from a killed instance
+  "$bin" --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble \
+    --disable-features=TranslateUI --no-first-run --no-default-browser-check --disable-pinch \
+    --overscroll-history-navigation=0 --check-for-update-interval=31536000 --password-store=basic \
+    --user-data-dir="$KIOSK_CHROMIUM_DIR" --disable-gpu --disable-dev-shm-usage --app="$target" >/dev/null 2>&1 &
   BROWSER_PID=$!
   BROWSER_WID=""   # Chromium --kiosk is already full-screen chromeless; no xdotool needed
   say "showing $target (chromium pid $BROWSER_PID)"
@@ -231,12 +238,16 @@ refresh_page() {   # send a reload (F5) to the kiosk window
 # a phase-2 manager endpoint.)
 launch_placeholder_browser() {
   local bin; bin=$(browser_bin)
-  if [[ -z $bin || $bin != falkon ]]; then
-    # Only Falkon supports a separate profile cleanly; without it, just blank to the X root.
-    PLACEHOLDER_PID=""
-    return 0
+  if [[ -z $bin ]]; then PLACEHOLDER_PID=""; return 0; fi
+  if [[ $bin == falkon ]]; then
+    falkon --profile maintenance "$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
+  else
+    # Chromium on a THROWAWAY profile ("-maint") so it never locks the shared profile the hidden
+    # maintenance-login session is using.
+    "$bin" --kiosk --noerrdialogs --no-first-run --no-default-browser-check --disable-gpu \
+      --disable-dev-shm-usage --user-data-dir="${KIOSK_CHROMIUM_DIR}-maint" \
+      --app="$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
   fi
-  falkon --profile maintenance "$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
   PLACEHOLDER_PID=$!
   say "maintenance: showing placeholder on the physical screen (pid $PLACEHOLDER_PID)"
 }

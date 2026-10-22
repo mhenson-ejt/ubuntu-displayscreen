@@ -40,7 +40,17 @@ KIOSK_USER=viewer
 KIOSK_HOME=/home/viewer
 source /etc/kiosk/kiosk.conf 2>/dev/null || true   # KIOSK_USER + KIOSK_HOME
 
+# Chromium profile SHARED with the live kiosk (webkiosk.sh uses the same path) so a login done here
+# carries straight over to the screen. Must match KIOSK_CHROMIUM_DIR in kiosk-webkiosk.
+CHROMIUM_DIR="$KIOSK_HOME/.config/kiosk-chromium"
+
 say() { logger -t kiosk-maintenance -- "$*" 2>/dev/null; echo "kiosk-maintenance: $*" >&2; }
+
+browser_bin() {
+  command -v chromium >/dev/null 2>&1 && { echo chromium; return; }
+  command -v chromium-browser >/dev/null 2>&1 && { echo chromium-browser; return; }
+  echo falkon
+}
 
 # Run an X client as the kiosk user, on a given display, WITH THE KIOSK USER'S HOME - critical, or
 # Falkon would use root's profile instead of the shared 'kiosk' one and the login wouldn't carry over.
@@ -51,19 +61,36 @@ as_user_x() {   # as_user_x DISPLAY cmd...
 }
 
 ensure_deps() {
-  local need=()
-  command -v Xvfb >/dev/null 2>&1 || need+=(xvfb)
-  command -v x11vnc >/dev/null 2>&1 || need+=(x11vnc)
-  command -v matchbox-window-manager >/dev/null 2>&1 || need+=(matchbox-window-manager)
-  command -v falkon >/dev/null 2>&1 || need+=(falkon)
-  command -v websockify >/dev/null 2>&1 || need+=(websockify)   # web VNC (noVNC in a browser)
-  [[ -d /usr/share/novnc ]] || need+=(novnc)
-  [[ ${#need[@]} -eq 0 ]] && return 0
-  say "installing ${need[*]} (archive .debs, no snap; falkon pulls QtWebEngine so this can take a few minutes)..."
+  local archive=()
+  command -v Xvfb >/dev/null 2>&1 || archive+=(xvfb)
+  command -v x11vnc >/dev/null 2>&1 || archive+=(x11vnc)
+  command -v matchbox-window-manager >/dev/null 2>&1 || archive+=(matchbox-window-manager)
+  command -v websockify >/dev/null 2>&1 || archive+=(websockify)   # web VNC (noVNC in a browser)
+  [[ -d /usr/share/novnc ]] || archive+=(novnc)
+
+  local need_chromium=0
+  command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 || need_chromium=1
+
+  [[ ${#archive[@]} -eq 0 && $need_chromium -eq 0 ]] && return 0
+
   # Output goes to stderr (visible when run by hand; the agent captures only the WEBVNC line on stdout).
-  DEBIAN_FRONTEND=noninteractive timeout 600 sh -c \
-    "apt-get -o Acquire::Retries=2 update && apt-get -o Acquire::Retries=2 -y install --no-install-recommends ${need[*]}" \
-    >&2 || { say "dependency install failed/timed out (lock held, or a slow/unreachable mirror)"; return 1; }
+  if (( need_chromium )); then
+    say "installing real Chromium from the xtradeb PPA (no snap; the archive's Falkon engine is too old for modern sites)..."
+    DEBIAN_FRONTEND=noninteractive timeout 600 bash -c '
+      apt-get update &&
+      apt-get -y install --no-install-recommends software-properties-common &&
+      add-apt-repository -y ppa:xtradeb/apps &&
+      apt-get update &&
+      apt-get -y install --no-install-recommends chromium' >&2 \
+      || { say "chromium install failed (PPA unreachable, or apt lock held)"; return 1; }
+  fi
+
+  if (( ${#archive[@]} )); then
+    say "installing ${archive[*]} (archive .debs)..."
+    DEBIAN_FRONTEND=noninteractive timeout 480 sh -c \
+      "apt-get -o Acquire::Retries=2 update && apt-get -o Acquire::Retries=2 -y install --no-install-recommends ${archive[*]}" \
+      >&2 || { say "dependency install failed/timed out (lock held, or a slow/unreachable mirror)"; return 1; }
+  fi
 }
 
 screen_res() {   # WxH of the PHYSICAL display, 1920x1080 fallback
@@ -91,8 +118,11 @@ start() {
   local i
   for i in $(seq 1 40); do [[ -e $MAINT_YIELDED ]] && break; sleep 0.5; done
   [[ -e $MAINT_YIELDED ]] || say "kiosk did not confirm yield - proceeding"
-  # belt-and-braces: nothing may hold the shared profile on :0
+  # belt-and-braces: nothing may still hold the shared profile on :0 (the trailing space keeps this
+  # from matching the placeholder's "...-maint" dir), and clear a stale Chromium lock.
+  pkill -u "$KIOSK_USER" -f -- "--user-data-dir=$CHROMIUM_DIR " 2>/dev/null || true
   pkill -u "$KIOSK_USER" -f "falkon.*--profile $PROFILE" 2>/dev/null || true
+  rm -f "$CHROMIUM_DIR/SingletonLock" 2>/dev/null || true
   sleep 1
 
   # 2) hidden display at the physical resolution (-ac: local-only, no xauth needed for the user)
@@ -102,12 +132,18 @@ start() {
   echo $! > "$STATE_DIR/xvfb.pid"
   sleep 1
 
-  # 3) a WM + a USABLE Falkon (toolbar kept so the admin can navigate/login) on the shared profile,
-  #    run as the kiosk user so it IS the live kiosk's profile.
+  # 3) a WM + a USABLE browser (address bar/tabs kept so the admin can navigate and sign in), on the
+  #    SHARED profile, run as the kiosk user so the cookies land where the live screen reads them.
   as_user_x "$HIDDEN_DISPLAY" matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
   echo $! > "$STATE_DIR/mbox.pid"
-  as_user_x "$HIDDEN_DISPLAY" falkon --profile "$PROFILE" "$url" >/dev/null 2>&1 &
-  echo $! > "$STATE_DIR/falkon.pid"
+  local browser; browser=$(browser_bin)
+  if [[ $browser == falkon ]]; then
+    as_user_x "$HIDDEN_DISPLAY" falkon --profile "$PROFILE" "$url" >/dev/null 2>&1 &
+  else
+    as_user_x "$HIDDEN_DISPLAY" "$browser" --user-data-dir="$CHROMIUM_DIR" --no-first-run \
+      --no-default-browser-check --disable-gpu --disable-dev-shm-usage --start-maximized "$url" >/dev/null 2>&1 &
+  fi
+  echo $! > "$STATE_DIR/browser.pid"
 
   # 4) one-time VNC password; x11vnc on LOCALHOST only (only the web port is LAN-exposed)
   local pw pwfile; pw=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
@@ -140,7 +176,7 @@ stop() {
   pkill -f "websockify.*$WEB_PORT" 2>/dev/null || true
   pkill -f "x11vnc.*-rfbport $VNC_PORT" 2>/dev/null || true
   local p
-  for p in falkon mbox xvfb; do
+  for p in browser mbox xvfb; do
     [[ -f $STATE_DIR/$p.pid ]] && kill "$(cat "$STATE_DIR/$p.pid")" 2>/dev/null || true
   done
   rm -f "$MAINT_FLAG"                  # webkiosk.sh drops the placeholder and resumes the kiosk
