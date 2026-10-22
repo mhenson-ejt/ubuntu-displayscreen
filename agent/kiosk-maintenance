@@ -104,10 +104,10 @@ lan_ip() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=
 is_web_kiosk() { [[ "$(jq -r '.screenType // 1' "$CONFIG" 2>/dev/null || echo 1)" == 2 ]]; }
 
 start() {
+  # Optional URL. Empty (the usual case) = open a general browser at the new-tab page, so the admin can
+  # go to and sign into ANY sites they need; those cookies land in the shared profile the screen uses.
   local url=${1:-}
   if ! is_web_kiosk; then say "not a web-kiosk screen - maintenance login does not apply"; return 2; fi
-  [[ -z $url ]] && url=$(jq -r '.webKiosk.pages[0].url // empty' "$CONFIG" 2>/dev/null || true)
-  [[ -z $url ]] && url="about:blank"
 
   ensure_deps || return 1
   mkdir -p "$RUN_DIR" "$STATE_DIR"; chmod 0777 "$RUN_DIR"
@@ -122,7 +122,12 @@ start() {
   # from matching the placeholder's "...-maint" dir), and clear a stale Chromium lock.
   pkill -u "$KIOSK_USER" -f -- "--user-data-dir=$CHROMIUM_DIR " 2>/dev/null || true
   pkill -u "$KIOSK_USER" -f "falkon.*--profile $PROFILE" 2>/dev/null || true
-  rm -f "$CHROMIUM_DIR/SingletonLock" 2>/dev/null || true
+  # Drop stale single-instance locks and the "didn't exit cleanly" flag a killed Chromium leaves, or
+  # the session comes up blank.
+  rm -f "$CHROMIUM_DIR"/Singleton* 2>/dev/null || true
+  [[ -f "$CHROMIUM_DIR/Default/Preferences" ]] && sed -i \
+    's/"exited_cleanly":false/"exited_cleanly":true/g; s/"exit_type":"[^"]*"/"exit_type":"Normal"/g' \
+    "$CHROMIUM_DIR/Default/Preferences" 2>/dev/null || true
   sleep 1
 
   # 2) hidden display at the physical resolution (-ac: local-only, no xauth needed for the user)
@@ -136,12 +141,13 @@ start() {
   #    SHARED profile, run as the kiosk user so the cookies land where the live screen reads them.
   as_user_x "$HIDDEN_DISPLAY" matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
   echo $! > "$STATE_DIR/mbox.pid"
+  # ${url:+"$url"} passes the URL only if one was given; otherwise the browser opens its new-tab page.
   local browser; browser=$(browser_bin)
   if [[ $browser == falkon ]]; then
-    as_user_x "$HIDDEN_DISPLAY" falkon --profile "$PROFILE" "$url" >/dev/null 2>&1 &
+    as_user_x "$HIDDEN_DISPLAY" falkon --profile "$PROFILE" ${url:+"$url"} >/dev/null 2>&1 &
   else
     as_user_x "$HIDDEN_DISPLAY" "$browser" --user-data-dir="$CHROMIUM_DIR" --no-first-run \
-      --no-default-browser-check --disable-gpu --disable-dev-shm-usage --start-maximized "$url" >/dev/null 2>&1 &
+      --no-default-browser-check --disable-gpu --disable-dev-shm-usage --start-maximized ${url:+"$url"} >/dev/null 2>&1 &
   fi
   echo $! > "$STATE_DIR/browser.pid"
 

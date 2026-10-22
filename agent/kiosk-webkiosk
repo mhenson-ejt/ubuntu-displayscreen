@@ -209,13 +209,23 @@ _launch_falkon() {   # Falkon in a dedicated profile, forced full-screen with xd
   fi
 }
 
+# A killed Chromium leaves single-instance locks and a "didn't exit cleanly" flag, which make the next
+# launch come up BLANK / with a restore prompt. Drop the locks and mark the last session clean before
+# every launch on a shared profile - this is what fixes the blank screen after a maintenance cycle.
+chromium_prep() {
+  local dir=$1
+  rm -f "$dir"/Singleton* 2>/dev/null || true
+  local prefs="$dir/Default/Preferences"
+  [[ -f $prefs ]] && sed -i 's/"exited_cleanly":false/"exited_cleanly":true/g; s/"exit_type":"[^"]*"/"exit_type":"Normal"/g' "$prefs" 2>/dev/null || true
+}
+
 _launch_chromium() {   # _launch_chromium BIN TARGET
   local bin=$1 target=$2
   # NOT --incognito: the kiosk keeps a persistent profile so logins (done in a maintenance session on
   # the same --user-data-dir) stick. --disable-gpu + friends: these NUCs run a bare X on old Intel
   # graphics where the GPU process often crashes to a black window; software rendering is plenty and
   # far more reliable. --disable-dev-shm-usage avoids crashes on the small default /dev/shm.
-  rm -f "$KIOSK_CHROMIUM_DIR/SingletonLock" 2>/dev/null || true   # clear a stale lock from a killed instance
+  chromium_prep "$KIOSK_CHROMIUM_DIR"
   "$bin" --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble \
     --disable-features=TranslateUI --no-first-run --no-default-browser-check --disable-pinch \
     --overscroll-history-navigation=0 --check-for-update-interval=31536000 --password-store=basic \
@@ -243,7 +253,8 @@ launch_placeholder_browser() {
     falkon --profile maintenance "$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
   else
     # Chromium on a THROWAWAY profile ("-maint") so it never locks the shared profile the hidden
-    # maintenance-login session is using.
+    # maintenance-login session is using. Wipe it first so it's always clean.
+    rm -rf "${KIOSK_CHROMIUM_DIR}-maint" 2>/dev/null || true
     "$bin" --kiosk --noerrdialogs --no-first-run --no-default-browser-check --disable-gpu \
       --disable-dev-shm-usage --user-data-dir="${KIOSK_CHROMIUM_DIR}-maint" \
       --app="$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
@@ -257,6 +268,13 @@ launch_placeholder_browser() {
 
 say "web kiosk display loop starting (config $CONFIG)"
 start_wm   # maximise the browser window on the bare, WM-less X
+
+# Keep the monitor awake. cams.sh sets these for the camera wall, but it execs us BEFORE doing so, so
+# a web-kiosk screen must do it itself - otherwise the display DPMS-blanks to "no signal" during a
+# long maintenance session (or any idle period) and never comes back.
+xset s off 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+xset s noblank 2>/dev/null || true
 
 TICK=${KIOSK_WEBKIOSK_TICK:-5}   # supervise cadence; also the dwell/refresh granularity
 
@@ -290,6 +308,7 @@ while true; do
     mkdir -p "$MAINT_DIR" 2>/dev/null || true; : > "$MAINT_YIELDED" 2>/dev/null || true
     while [[ -e $MAINT_FLAG ]]; do sleep "$TICK"; done
     say "maintenance cleared - resuming kiosk"
+    xset -dpms 2>/dev/null || true; xset s off 2>/dev/null || true; xset dpms force on 2>/dev/null || true
     [[ -n ${PLACEHOLDER_PID:-} ]] && { kill "$PLACEHOLDER_PID" 2>/dev/null || true; wait "$PLACEHOLDER_PID" 2>/dev/null || true; }
     rm -f "$MAINT_YIELDED" 2>/dev/null || true
     read_cfg; cur=0
