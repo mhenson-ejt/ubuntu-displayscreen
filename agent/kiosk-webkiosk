@@ -25,6 +25,13 @@ set -uo pipefail
 CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
 CHECK_INTERVAL=${KIOSK_WEBKIOSK_INTERVAL:-10}   # reachability + config poll cadence (seconds)
 
+# Maintenance (kiosk-maintenance script): while this flag file exists we yield :0 - kill the live
+# kiosk browser (releasing the shared 'kiosk' Falkon profile so the hidden login session can use it)
+# and show a placeholder from a THROWAWAY profile, so onlookers never see the admin logging in.
+MAINT_DIR=${KIOSK_RUN_DIR:-/run/kiosk}
+MAINT_FLAG="$MAINT_DIR/maintenance"
+MAINT_YIELDED="$MAINT_DIR/maintenance-yielded"
+
 say() { logger -t kiosk-webkiosk -- "$*" 2>/dev/null; echo "kiosk-webkiosk: $*" >&2; }
 
 # The placeholder pages are served over HTTP by the manager (the URL the agent already syncs with) so
@@ -218,6 +225,22 @@ refresh_page() {   # send a reload (F5) to the kiosk window
   xdotool key --clearmodifiers F5 2>/dev/null || true
 }
 
+# launch_placeholder_browser -> show a placeholder on :0 during maintenance, in a THROWAWAY profile
+# ('maintenance') so it can't clash with the shared 'kiosk' profile the hidden login session holds.
+# Sets PLACEHOLDER_PID. (Phase 1 reuses the default placeholder; a branded maintenance placeholder is
+# a phase-2 manager endpoint.)
+launch_placeholder_browser() {
+  local bin; bin=$(browser_bin)
+  if [[ -z $bin || $bin != falkon ]]; then
+    # Only Falkon supports a separate profile cleanly; without it, just blank to the X root.
+    PLACEHOLDER_PID=""
+    return 0
+  fi
+  falkon --profile maintenance "$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
+  PLACEHOLDER_PID=$!
+  say "maintenance: showing placeholder on the physical screen (pid $PLACEHOLDER_PID)"
+}
+
 # Sourced by the test harness, which stubs the helpers and drives them directly.
 [[ -n ${KIOSK_WEBKIOSK_TEST:-} ]] && return 0
 
@@ -245,6 +268,31 @@ now=$(date +%s); page_since=$now; last_refresh=$now
 while true; do
   sleep "$TICK"
   [[ -n ${KIOSK_DRYRUN:-} ]] && break
+
+  # Maintenance gate: yield :0 while an admin logs in over the hidden VNC session. Kill the live
+  # kiosk browser (releasing the shared profile), show a placeholder from a throwaway profile, idle
+  # until the flag clears, then resume the kiosk (which reloads authenticated from the shared profile).
+  if [[ -e $MAINT_FLAG ]]; then
+    say "maintenance active - yielding the display"
+    kill "$BROWSER_PID" 2>/dev/null || true; wait "$BROWSER_PID" 2>/dev/null || true
+    launch_placeholder_browser
+    mkdir -p "$MAINT_DIR" 2>/dev/null || true; : > "$MAINT_YIELDED" 2>/dev/null || true
+    while [[ -e $MAINT_FLAG ]]; do sleep "$TICK"; done
+    say "maintenance cleared - resuming kiosk"
+    [[ -n ${PLACEHOLDER_PID:-} ]] && { kill "$PLACEHOLDER_PID" 2>/dev/null || true; wait "$PLACEHOLDER_PID" 2>/dev/null || true; }
+    rm -f "$MAINT_YIELDED" 2>/dev/null || true
+    read_cfg; cur=0
+    target=$(target_at "$cur")
+    until launch_browser "$target"; do
+      sleep "$CHECK_INTERVAL"
+      [[ -e $MAINT_FLAG ]] && break
+      read_cfg; [[ $SCREEN_TYPE != 2 ]] && { say "no longer web kiosk - exiting"; exit 0; }
+      target=$(target_at "$cur")
+    done
+    shown=$target; now=$(date +%s); page_since=$now; last_refresh=$now
+    cfg_sig=$(md5sum "$CONFIG" 2>/dev/null | awk '{print $1}')
+    continue
+  fi
 
   # Browser gone (crash, killed)? Relaunch at the current page.
   if ! kill -0 "$BROWSER_PID" 2>/dev/null; then

@@ -287,6 +287,10 @@ fetch_file agent/kiosk-webkiosk /etc/kiosk/webkiosk.sh 750
 chown "root:$KIOSK_USER" /etc/kiosk/webkiosk.sh
 fetch_file agent/placeholder-default.html /etc/kiosk/placeholder-default.html 644
 fetch_file agent/placeholder-unreachable.html /etc/kiosk/placeholder-unreachable.html 644
+# Maintenance login (agent v2.15): runs a hidden, VNC-accessible Falkon on the shared profile so an
+# admin can log into pages whose cookies then persist to the live screen. Deps (xvfb/x11vnc) install
+# on first use, not here. Only a web-kiosk screen ever uses it.
+fetch_file agent/kiosk-maintenance /usr/local/sbin/kiosk-maintenance 755
 fetch_file agent/kiosk-display.service /etc/systemd/system/kiosk-display.service 644
 sed -i "s/@KIOSK_USER@/$KIOSK_USER/" /etc/systemd/system/kiosk-display.service
 

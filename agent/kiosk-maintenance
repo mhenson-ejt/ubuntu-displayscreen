@@ -1,0 +1,143 @@
+#!/bin/bash
+#===============================================================================
+# kiosk-maintenance - log into a web-kiosk screen's pages without onlookers
+# seeing it, installed as /usr/local/sbin/kiosk-maintenance.
+#
+#   kiosk-maintenance on [URL]   # start; prints a VNC host:port + one-time password
+#   kiosk-maintenance off        # stop and resume the kiosk
+#
+# While active:
+#   - the PHYSICAL screen (:0) shows a placeholder - webkiosk.sh sees the flag
+#     file, kills the live kiosk browser (releasing the shared Falkon profile)
+#     and shows a placeholder from a THROWAWAY profile, so onlookers see nothing.
+#   - the real login runs on a HIDDEN Xvfb display, in Falkon on the SAME
+#     'kiosk' profile the live screen uses, RUN AS THE KIOSK USER - so the
+#     cookies you create there persist straight back to the live screen.
+#   - x11vnc serves that hidden display on the LAN with a one-time password, so
+#     an admin can drive the login with a keyboard + mouse remotely.
+# On 'off' (or the hard timeout) everything is torn down and webkiosk.sh resumes
+# the kiosk, which reloads ALREADY AUTHENTICATED from the shared profile.
+#
+# Phase 1: LAN-direct VNC (one-time password, auto-timeout). The manager can
+# drive it through the agent's maintenance-on/off commands; it can also be run
+# by hand on the box for testing.
+#===============================================================================
+set -uo pipefail
+
+RUN_DIR=/run/kiosk
+MAINT_FLAG="$RUN_DIR/maintenance"
+MAINT_YIELDED="$RUN_DIR/maintenance-yielded"
+STATE_DIR="$RUN_DIR/maint"
+CONFIG=${KIOSK_CONFIG:-/etc/kiosk/config.json}
+PROFILE=kiosk                                   # the SHARED Falkon profile the live kiosk uses
+HIDDEN_DISPLAY=${KIOSK_MAINT_DISPLAY:-:20}      # hidden Xvfb display (far from :0)
+VNC_PORT=${KIOSK_MAINT_VNC_PORT:-5900}
+MAX_MINUTES=${KIOSK_MAINT_MAX_MINUTES:-30}      # hard cap - tear down no matter what
+SELF=/usr/local/sbin/kiosk-maintenance
+
+KIOSK_USER=viewer
+KIOSK_HOME=/home/viewer
+source /etc/kiosk/kiosk.conf 2>/dev/null || true   # KIOSK_USER + KIOSK_HOME
+
+say() { logger -t kiosk-maintenance -- "$*" 2>/dev/null; echo "kiosk-maintenance: $*" >&2; }
+
+# Run an X client as the kiosk user, on a given display, WITH THE KIOSK USER'S HOME - critical, or
+# Falkon would use root's profile instead of the shared 'kiosk' one and the login wouldn't carry over.
+# (runuser without -l keeps root's env, so HOME and DISPLAY are set explicitly.)
+as_user_x() {   # as_user_x DISPLAY cmd...
+  local disp=$1; shift
+  runuser -u "$KIOSK_USER" -- env HOME="$KIOSK_HOME" DISPLAY="$disp" "$@"
+}
+
+ensure_deps() {
+  local need=()
+  command -v Xvfb >/dev/null 2>&1 || need+=(xvfb)
+  command -v x11vnc >/dev/null 2>&1 || need+=(x11vnc)
+  command -v matchbox-window-manager >/dev/null 2>&1 || need+=(matchbox-window-manager)
+  command -v falkon >/dev/null 2>&1 || need+=(falkon)
+  [[ ${#need[@]} -eq 0 ]] && return 0
+  say "installing ${need[*]} (archive .debs, no snap)..."
+  DEBIAN_FRONTEND=noninteractive timeout 480 sh -c \
+    "apt-get -o Acquire::Retries=2 -qq update && apt-get -o Acquire::Retries=2 -y install --no-install-recommends ${need[*]}" \
+    >/dev/null 2>&1 || { say "dependency install failed/timed out"; return 1; }
+}
+
+screen_res() {   # WxH of the PHYSICAL display, 1920x1080 fallback
+  local d
+  d=$(as_user_x :0 xrandr 2>/dev/null | awk '/current/{sub(",", "", $10); printf "%sx%s", $8, $10; exit}')
+  [[ $d =~ ^[0-9]+x[0-9]+$ ]] && echo "$d" || echo "1920x1080"
+}
+
+lan_ip() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'; }
+
+is_web_kiosk() { [[ "$(jq -r '.screenType // 1' "$CONFIG" 2>/dev/null || echo 1)" == 2 ]]; }
+
+start() {
+  local url=${1:-}
+  if ! is_web_kiosk; then say "not a web-kiosk screen - maintenance login does not apply"; return 2; fi
+  [[ -z $url ]] && url=$(jq -r '.webKiosk.pages[0].url // empty' "$CONFIG" 2>/dev/null || true)
+  [[ -z $url ]] && url="about:blank"
+
+  ensure_deps || return 1
+  mkdir -p "$RUN_DIR" "$STATE_DIR"; chmod 0777 "$RUN_DIR"
+
+  # 1) ask webkiosk.sh to yield :0, and wait for it to release the shared profile
+  : > "$MAINT_FLAG"
+  say "waiting for the kiosk to yield the display..."
+  local i
+  for i in $(seq 1 40); do [[ -e $MAINT_YIELDED ]] && break; sleep 0.5; done
+  [[ -e $MAINT_YIELDED ]] || say "kiosk did not confirm yield - proceeding"
+  # belt-and-braces: nothing may hold the shared profile on :0
+  pkill -u "$KIOSK_USER" -f "falkon.*--profile $PROFILE" 2>/dev/null || true
+  sleep 1
+
+  # 2) hidden display at the physical resolution (-ac: local-only, no xauth needed for the user)
+  local res; res=$(screen_res)
+  say "starting hidden display $HIDDEN_DISPLAY at $res"
+  Xvfb "$HIDDEN_DISPLAY" -screen 0 "${res}x24" -ac -nolisten tcp >/dev/null 2>&1 &
+  echo $! > "$STATE_DIR/xvfb.pid"
+  sleep 1
+
+  # 3) a WM + a USABLE Falkon (toolbar kept so the admin can navigate/login) on the shared profile,
+  #    run as the kiosk user so it IS the live kiosk's profile.
+  as_user_x "$HIDDEN_DISPLAY" matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
+  echo $! > "$STATE_DIR/mbox.pid"
+  as_user_x "$HIDDEN_DISPLAY" falkon --profile "$PROFILE" "$url" >/dev/null 2>&1 &
+  echo $! > "$STATE_DIR/falkon.pid"
+
+  # 4) one-time VNC password; serve the hidden display on the LAN
+  local pw pwfile; pw=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
+  pwfile="$STATE_DIR/vnc.pass"
+  x11vnc -storepasswd "$pw" "$pwfile" >/dev/null 2>&1
+  say "serving hidden display over VNC on port $VNC_PORT"
+  x11vnc -display "$HIDDEN_DISPLAY" -rfbport "$VNC_PORT" -rfbauth "$pwfile" \
+         -forever -shared -noxdamage -timeout 120 -bg >/dev/null 2>&1
+
+  # 5) hard cap: auto-exit after MAX_MINUTES regardless
+  ( sleep $(( MAX_MINUTES * 60 )); [[ -e $MAINT_FLAG ]] && "$SELF" off ) >/dev/null 2>&1 &
+  echo $! > "$STATE_DIR/watchdog.pid"
+
+  local ip; ip=$(lan_ip)
+  say "MAINTENANCE READY  vnc=${ip:-<screen-ip>}:$VNC_PORT  password=$pw  expires=${MAX_MINUTES}m  url=$url"
+  # machine-readable last line for the agent to relay to the manager
+  echo "VNC ${ip:-unknown} $VNC_PORT $pw $MAX_MINUTES"
+}
+
+stop() {
+  say "stopping maintenance"
+  [[ -f $STATE_DIR/watchdog.pid ]] && kill "$(cat "$STATE_DIR/watchdog.pid")" 2>/dev/null || true
+  pkill -f "x11vnc.*-rfbport $VNC_PORT" 2>/dev/null || true
+  local p
+  for p in falkon mbox xvfb; do
+    [[ -f $STATE_DIR/$p.pid ]] && kill "$(cat "$STATE_DIR/$p.pid")" 2>/dev/null || true
+  done
+  rm -f "$MAINT_FLAG"                  # webkiosk.sh drops the placeholder and resumes the kiosk
+  rm -rf "$STATE_DIR"
+  say "maintenance ended - kiosk resuming (authenticated from the shared profile)"
+}
+
+case "${1:-}" in
+  on)  shift; start "${1:-}";;
+  off) stop;;
+  *)   echo "usage: kiosk-maintenance on [URL] | off" >&2; exit 2;;
+esac

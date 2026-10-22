@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.14"
+AGENT_VERSION="2.15"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -154,6 +154,10 @@ ensure_webkiosk_browser() {
   command -v falkon >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1 \
     || command -v chromium-browser >/dev/null 2>&1 || need+=(falkon)
   command -v matchbox-window-manager >/dev/null 2>&1 || need+=(matchbox-window-manager)
+  # Maintenance-login deps (hidden display + VNC) - front-loaded here so the first maintenance-on is
+  # instant rather than blocking the agent on an apt install.
+  command -v Xvfb >/dev/null 2>&1 || need+=(xvfb)
+  command -v x11vnc >/dev/null 2>&1 || need+=(x11vnc)
   [[ ${#need[@]} -eq 0 ]] && return 0
   log "web kiosk: installing ${need[*]} (real .deb(s) from the Ubuntu archive, no snap)..."
   if DEBIAN_FRONTEND=noninteractive timeout 480 sh -c \
@@ -451,6 +455,27 @@ handle_command() {
         ack "$id" ok "magic packet broadcast for $mac"
       else
         ack "$id" error "bad MAC or send failed: $mac"
+      fi
+      ;;
+    maintenance-on)
+      # Start a hidden VNC login session (see kiosk-maintenance). The script's last line is
+      # "VNC <ip> <port> <password> <minutes>" - relay it so the manager can show the admin how to
+      # connect. The password is one-time and the session self-expires.
+      if command -v kiosk-maintenance >/dev/null 2>&1; then
+        local vnc
+        vnc=$(kiosk-maintenance on 2>/dev/null | grep '^VNC ' | tail -1)
+        if [[ -n $vnc ]]; then ack "$id" ok "$vnc"
+        else ack "$id" error "maintenance start failed (see journalctl -t kiosk-maintenance)"; fi
+      else
+        ack "$id" error "kiosk-maintenance not installed (update the agent)"
+      fi
+      ;;
+    maintenance-off)
+      if command -v kiosk-maintenance >/dev/null 2>&1; then
+        kiosk-maintenance off >/dev/null 2>&1 && ack "$id" ok "maintenance ended" \
+          || ack "$id" error "maintenance stop failed"
+      else
+        ack "$id" error "kiosk-maintenance not installed"
       fi
       ;;
     *)
