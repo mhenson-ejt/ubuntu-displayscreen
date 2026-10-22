@@ -167,9 +167,13 @@ start() {
   if [[ $browser == falkon ]]; then
     as_user_x "$HIDDEN_DISPLAY" falkon --profile maintenance-login ${url:+"$url"} >/dev/null 2>&1 &
   else
+    # --password-store=basic: a FIXED cookie-encryption key, matching the live display browser - or
+    # the cookies saved here (encrypted with the keyring/dbus-session key) can't be decrypted after
+    # they're copied to the live profile, and the screen comes back logged OUT.
     as_user_x "$HIDDEN_DISPLAY" dbus-run-session -- "$browser" --user-data-dir="$CHROMIUM_LOGIN_DIR" \
-      --no-first-run --no-default-browser-check --use-gl=angle --use-angle=swiftshader \
-      --enable-unsafe-swiftshader --disable-dev-shm-usage --start-maximized ${url:+"$url"} >/dev/null 2>&1 &
+      --password-store=basic --no-first-run --no-default-browser-check --use-gl=angle \
+      --use-angle=swiftshader --enable-unsafe-swiftshader --disable-dev-shm-usage --start-maximized \
+      ${url:+"$url"} >/dev/null 2>&1 &
   fi
   echo $! > "$STATE_DIR/browser.pid"
 
@@ -207,7 +211,7 @@ stop() {
   for p in browser mbox xvfb; do
     [[ -f $STATE_DIR/$p.pid ]] && kill "$(cat "$STATE_DIR/$p.pid")" 2>/dev/null || true
   done
-  sleep 1   # let the login Chromium exit and flush its cookies to disk
+  sleep 2   # let the login browser exit and flush its cookies to disk before we copy them
 
   # Copy the login back to the live profile. The display is still yielded (webkiosk is showing the
   # placeholder, waiting for the flag), so the live profile is free to overwrite.
