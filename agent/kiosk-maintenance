@@ -40,9 +40,11 @@ KIOSK_USER=viewer
 KIOSK_HOME=/home/viewer
 source /etc/kiosk/kiosk.conf 2>/dev/null || true   # KIOSK_USER + KIOSK_HOME
 
-# Chromium profile SHARED with the live kiosk (webkiosk.sh uses the same path) so a login done here
-# carries straight over to the screen. Must match KIOSK_CHROMIUM_DIR in kiosk-webkiosk.
+# The live kiosk's Chromium profile (webkiosk.sh's KIOSK_CHROMIUM_DIR). The maintenance login runs on
+# a SEPARATE profile and the login is copied back here on exit - sharing one profile live was racy:
+# any kiosk-display restart relaunched a browser on it and collided (single-instance) with the login.
 CHROMIUM_DIR="$KIOSK_HOME/.config/kiosk-chromium"
+CHROMIUM_LOGIN_DIR="$KIOSK_HOME/.config/kiosk-chromium-login"
 
 say() { logger -t kiosk-maintenance -- "$*" 2>/dev/null; echo "kiosk-maintenance: $*" >&2; }
 
@@ -50,6 +52,22 @@ browser_bin() {
   command -v chromium >/dev/null 2>&1 && { echo chromium; return; }
   command -v chromium-browser >/dev/null 2>&1 && { echo chromium-browser; return; }
   echo falkon
+}
+
+# seed_profile SRC DST -> DST becomes a clean copy of SRC (kiosk-user-owned, single-instance locks
+# dropped); DST is emptied if SRC is absent. Used to seed the login profile from the live one and to
+# copy the login back afterwards. Callers must ensure neither profile is in use.
+seed_profile() {
+  local src=$1 dst=$2
+  rm -rf "$dst" 2>/dev/null || true
+  if [[ -d $src ]]; then
+    cp -a "$src" "$dst" 2>/dev/null || true
+    chown -R "$KIOSK_USER":"$KIOSK_USER" "$dst" 2>/dev/null || true
+    rm -f "$dst"/Singleton* 2>/dev/null || true
+    [[ -f "$dst/Default/Preferences" ]] && sed -i \
+      's/"exited_cleanly":false/"exited_cleanly":true/g; s/"exit_type":"[^"]*"/"exit_type":"Normal"/g' \
+      "$dst/Default/Preferences" 2>/dev/null || true
+  fi
 }
 
 # Run an X client as the kiosk user, on a given display, WITH THE KIOSK USER'S HOME - critical, or
@@ -112,23 +130,18 @@ start() {
   ensure_deps || return 1
   mkdir -p "$RUN_DIR" "$STATE_DIR"; chmod 0777 "$RUN_DIR"
 
-  # 1) ask webkiosk.sh to yield :0, and wait for it to release the shared profile
+  # 1) ask webkiosk.sh to yield :0 (show the placeholder, stop the live browser), and wait for it.
   : > "$MAINT_FLAG"
   say "waiting for the kiosk to yield the display..."
   local i
   for i in $(seq 1 40); do [[ -e $MAINT_YIELDED ]] && break; sleep 0.5; done
   [[ -e $MAINT_YIELDED ]] || say "kiosk did not confirm yield - proceeding"
-  # belt-and-braces: nothing may still hold the shared profile on :0 (the trailing space keeps this
-  # from matching the placeholder's "...-maint" dir), and clear a stale Chromium lock.
-  pkill -u "$KIOSK_USER" -f -- "--user-data-dir=$CHROMIUM_DIR " 2>/dev/null || true
-  pkill -u "$KIOSK_USER" -f "falkon.*--profile $PROFILE" 2>/dev/null || true
-  # Drop stale single-instance locks and the "didn't exit cleanly" flag a killed Chromium leaves, or
-  # the session comes up blank.
-  rm -f "$CHROMIUM_DIR"/Singleton* 2>/dev/null || true
-  [[ -f "$CHROMIUM_DIR/Default/Preferences" ]] && sed -i \
-    's/"exited_cleanly":false/"exited_cleanly":true/g; s/"exit_type":"[^"]*"/"exit_type":"Normal"/g' \
-    "$CHROMIUM_DIR/Default/Preferences" 2>/dev/null || true
   sleep 1
+
+  # Seed the SEPARATE login profile from the live one, so the admin sees the sites already signed in
+  # and can add/renew more. The live profile is free now (the display is yielded). Using a separate
+  # profile means a kiosk-display restart mid-session can never collide with the login.
+  seed_profile "$CHROMIUM_DIR" "$CHROMIUM_LOGIN_DIR"
 
   # 2) hidden display at the physical resolution (-ac: local-only, no xauth needed for the user)
   local res; res=$(screen_res)
@@ -138,15 +151,16 @@ start() {
   sleep 1
 
   # 3) a WM + a USABLE browser (address bar/tabs kept so the admin can navigate and sign in), on the
-  #    SHARED profile, run as the kiosk user so the cookies land where the live screen reads them.
+  #    SEPARATE login profile, run as the kiosk user. Cookies land in CHROMIUM_LOGIN_DIR and are copied
+  #    back to the live profile on exit.
   as_user_x "$HIDDEN_DISPLAY" matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
   echo $! > "$STATE_DIR/mbox.pid"
   # ${url:+"$url"} passes the URL only if one was given; otherwise the browser opens its new-tab page.
   local browser; browser=$(browser_bin)
   if [[ $browser == falkon ]]; then
-    as_user_x "$HIDDEN_DISPLAY" falkon --profile "$PROFILE" ${url:+"$url"} >/dev/null 2>&1 &
+    as_user_x "$HIDDEN_DISPLAY" falkon --profile maintenance-login ${url:+"$url"} >/dev/null 2>&1 &
   else
-    as_user_x "$HIDDEN_DISPLAY" "$browser" --user-data-dir="$CHROMIUM_DIR" --no-first-run \
+    as_user_x "$HIDDEN_DISPLAY" "$browser" --user-data-dir="$CHROMIUM_LOGIN_DIR" --no-first-run \
       --no-default-browser-check --disable-gpu --disable-dev-shm-usage --start-maximized ${url:+"$url"} >/dev/null 2>&1 &
   fi
   echo $! > "$STATE_DIR/browser.pid"
@@ -185,9 +199,18 @@ stop() {
   for p in browser mbox xvfb; do
     [[ -f $STATE_DIR/$p.pid ]] && kill "$(cat "$STATE_DIR/$p.pid")" 2>/dev/null || true
   done
-  rm -f "$MAINT_FLAG"                  # webkiosk.sh drops the placeholder and resumes the kiosk
+  sleep 1   # let the login Chromium exit and flush its cookies to disk
+
+  # Copy the login back to the live profile. The display is still yielded (webkiosk is showing the
+  # placeholder, waiting for the flag), so the live profile is free to overwrite.
+  if [[ -d "$CHROMIUM_LOGIN_DIR" ]]; then
+    seed_profile "$CHROMIUM_LOGIN_DIR" "$CHROMIUM_DIR"
+    say "login copied to the live profile"
+  fi
+
+  rm -f "$MAINT_FLAG"                  # webkiosk.sh drops the placeholder and resumes the kiosk (signed in)
   rm -rf "$STATE_DIR"
-  say "maintenance ended - kiosk resuming (authenticated from the shared profile)"
+  say "maintenance ended - kiosk resuming (signed in)"
 }
 
 if [[ $EUID -ne 0 ]]; then
