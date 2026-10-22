@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.23"
+AGENT_VERSION="2.24"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -465,8 +465,11 @@ handle_command() {
       # our API token, so no re-registration happens. The new version shows on the next poll.
       ack "$id" ok "updating from v$AGENT_VERSION"
       local update_base=${SCRIPT_BASE_URL:-https://raw.githubusercontent.com/mhenson-ejt/ubuntu-displayscreen/main}
+      # Compute the cache-buster HERE so it expands to a literal below. As \$(date) inside the inner
+      # single-quoted URL it stays literal and curl rejects the URL ("Malformed input to a URL").
+      local cb; cb=$(date +%s%N)
       systemd-run --unit=kiosk-agent-update --collect \
-        bash -c "sleep 2; curl -fsSL -H 'Cache-Control: no-cache' '$update_base/kiosk-setup.sh?cb=\$(date +%s%N)' | MANAGER_URL='$MANAGER_URL' ENROLL_TOKEN='${ENROLL_TOKEN:-}' KIOSK_USER='${KIOSK_USER:-viewer}' SCRIPT_BASE_URL='$update_base' bash" \
+        bash -c "sleep 2; curl -fsSL -H 'Cache-Control: no-cache' '$update_base/kiosk-setup.sh?cb=$cb' | MANAGER_URL='$MANAGER_URL' ENROLL_TOKEN='${ENROLL_TOKEN:-}' KIOSK_USER='${KIOSK_USER:-viewer}' SCRIPT_BASE_URL='$update_base' bash" \
         >/dev/null 2>&1 \
         || ack "$id" error "failed to launch the updater (see journalctl -u kiosk-agent-update)"
       ;;
