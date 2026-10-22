@@ -47,9 +47,11 @@ _resolve_placeholders() {
   if [[ -n $m ]]; then
     PLACEHOLDER_DEFAULT_TARGET="$m/kiosk/placeholder/default"
     PLACEHOLDER_UNREACHABLE_TARGET="$m/kiosk/placeholder/unreachable"
+    PLACEHOLDER_MAINTENANCE_TARGET="$m/kiosk/placeholder/maintenance"
   else
     PLACEHOLDER_DEFAULT_TARGET="file://${KIOSK_PLACEHOLDER_DEFAULT:-/etc/kiosk/placeholder-default.html}"
     PLACEHOLDER_UNREACHABLE_TARGET="file://${KIOSK_PLACEHOLDER_UNREACHABLE:-/etc/kiosk/placeholder-unreachable.html}"
+    PLACEHOLDER_MAINTENANCE_TARGET="$PLACEHOLDER_DEFAULT_TARGET"
   fi
 }
 MANAGER_URL=""
@@ -251,14 +253,14 @@ launch_placeholder_browser() {
   local bin; bin=$(browser_bin)
   if [[ -z $bin ]]; then PLACEHOLDER_PID=""; return 0; fi
   if [[ $bin == falkon ]]; then
-    falkon --profile maintenance "$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
+    falkon --profile maintenance "$PLACEHOLDER_MAINTENANCE_TARGET" >/dev/null 2>&1 &
   else
     # Chromium on a THROWAWAY profile ("-maint") so it never locks the shared profile the hidden
     # maintenance-login session is using. Wipe it first so it's always clean.
     rm -rf "${KIOSK_CHROMIUM_DIR}-maint" 2>/dev/null || true
     "$bin" --kiosk --noerrdialogs --no-first-run --no-default-browser-check --disable-gpu \
       --disable-dev-shm-usage --user-data-dir="${KIOSK_CHROMIUM_DIR}-maint" \
-      --app="$PLACEHOLDER_DEFAULT_TARGET" >/dev/null 2>&1 &
+      --app="$PLACEHOLDER_MAINTENANCE_TARGET" >/dev/null 2>&1 &
   fi
   PLACEHOLDER_PID=$!
   say "maintenance: showing placeholder on the physical screen (pid $PLACEHOLDER_PID)"

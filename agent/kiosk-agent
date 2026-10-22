@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.21"
+AGENT_VERSION="2.22"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -466,7 +466,7 @@ handle_command() {
       ack "$id" ok "updating from v$AGENT_VERSION"
       local update_base=${SCRIPT_BASE_URL:-https://raw.githubusercontent.com/mhenson-ejt/ubuntu-displayscreen/main}
       systemd-run --unit=kiosk-agent-update --collect \
-        bash -c "sleep 2; curl -fsSL '$update_base/kiosk-setup.sh' | MANAGER_URL='$MANAGER_URL' ENROLL_TOKEN='${ENROLL_TOKEN:-}' KIOSK_USER='${KIOSK_USER:-viewer}' SCRIPT_BASE_URL='$update_base' bash" \
+        bash -c "sleep 2; curl -fsSL -H 'Cache-Control: no-cache' '$update_base/kiosk-setup.sh?cb=\$(date +%s%N)' | MANAGER_URL='$MANAGER_URL' ENROLL_TOKEN='${ENROLL_TOKEN:-}' KIOSK_USER='${KIOSK_USER:-viewer}' SCRIPT_BASE_URL='$update_base' bash" \
         >/dev/null 2>&1 \
         || ack "$id" error "failed to launch the updater (see journalctl -u kiosk-agent-update)"
       ;;

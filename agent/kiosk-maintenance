@@ -160,12 +160,16 @@ start() {
   as_user_x "$HIDDEN_DISPLAY" matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
   echo $! > "$STATE_DIR/mbox.pid"
   # ${url:+"$url"} passes the URL only if one was given; otherwise the browser opens its new-tab page.
+  # dbus-run-session gives Chrome a real session bus, and software WebGL (swiftshader) instead of
+  # --disable-gpu, so the browser presents as a normal desktop browser - a stripped kiosk env (no bus,
+  # no WebGL) is what trips sites like claude.ai into a CAPTCHA loop. The admin still solves any CAPTCHA.
   local browser; browser=$(browser_bin)
   if [[ $browser == falkon ]]; then
     as_user_x "$HIDDEN_DISPLAY" falkon --profile maintenance-login ${url:+"$url"} >/dev/null 2>&1 &
   else
-    as_user_x "$HIDDEN_DISPLAY" "$browser" --user-data-dir="$CHROMIUM_LOGIN_DIR" --no-first-run \
-      --no-default-browser-check --disable-gpu --disable-dev-shm-usage --start-maximized ${url:+"$url"} >/dev/null 2>&1 &
+    as_user_x "$HIDDEN_DISPLAY" dbus-run-session -- "$browser" --user-data-dir="$CHROMIUM_LOGIN_DIR" \
+      --no-first-run --no-default-browser-check --use-gl=angle --use-angle=swiftshader \
+      --enable-unsafe-swiftshader --disable-dev-shm-usage --start-maximized ${url:+"$url"} >/dev/null 2>&1 &
   fi
   echo $! > "$STATE_DIR/browser.pid"
 

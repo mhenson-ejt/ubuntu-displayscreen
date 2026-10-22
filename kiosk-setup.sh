@@ -90,7 +90,10 @@ fetch_file() { # fetch_file <repo-relative-path> <dest> <mode>
   else
     log "  $rel -> $dest (downloading)"
     local tmp; tmp=$(mktemp)
-    curl -fsSL --connect-timeout 10 --max-time 120 "$SCRIPT_BASE_URL/$rel" -o "$tmp" \
+    # ?cb=<unique> + no-cache headers defeat GitHub's raw CDN per-file cache, which otherwise serves
+    # some files stale after a push (e.g. a fresh kiosk-maintenance but an old kiosk-webkiosk).
+    curl -fsSL --connect-timeout 10 --max-time 120 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      "$SCRIPT_BASE_URL/$rel?cb=$(date +%s%N)" -o "$tmp" \
       || die "Failed to download $SCRIPT_BASE_URL/$rel"
     install -m "$mode" "$tmp" "$dest"
     rm -f "$tmp"
