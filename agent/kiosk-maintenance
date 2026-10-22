@@ -49,8 +49,10 @@ CHROMIUM_LOGIN_DIR="$KIOSK_HOME/.config/kiosk-chromium-login"
 say() { logger -t kiosk-maintenance -- "$*" 2>/dev/null; echo "kiosk-maintenance: $*" >&2; }
 
 browser_bin() {
-  command -v chromium >/dev/null 2>&1 && { echo chromium; return; }
-  command -v chromium-browser >/dev/null 2>&1 && { echo chromium-browser; return; }
+  local b
+  for b in google-chrome-stable google-chrome chromium chromium-browser falkon; do
+    command -v "$b" >/dev/null 2>&1 && { echo "$b"; return; }
+  done
   echo falkon
 }
 
@@ -86,21 +88,23 @@ ensure_deps() {
   command -v websockify >/dev/null 2>&1 || archive+=(websockify)   # web VNC (noVNC in a browser)
   [[ -d /usr/share/novnc ]] || archive+=(novnc)
 
-  local need_chromium=0
-  command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 || need_chromium=1
+  local need_chrome=0
+  command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || need_chrome=1
 
-  [[ ${#archive[@]} -eq 0 && $need_chromium -eq 0 ]] && return 0
+  [[ ${#archive[@]} -eq 0 && $need_chrome -eq 0 ]] && return 0
 
   # Output goes to stderr (visible when run by hand; the agent captures only the WEBVNC line on stdout).
-  if (( need_chromium )); then
-    say "installing real Chromium from the xtradeb PPA (no snap; the archive's Falkon engine is too old for modern sites)..."
-    DEBIAN_FRONTEND=noninteractive timeout 600 bash -c '
-      apt-get update &&
-      apt-get -y install --no-install-recommends software-properties-common &&
-      add-apt-repository -y ppa:xtradeb/apps &&
-      apt-get update &&
-      apt-get -y install --no-install-recommends chromium' >&2 \
-      || { say "chromium install failed (PPA unreachable, or apt lock held)"; return 1; }
+  if (( need_chrome )); then
+    say "installing Google Chrome (real .deb, no snap; the snap is confined and ignores --user-data-dir)..."
+    snap remove --purge chromium >&2 2>/dev/null || true
+    local deb; deb=$(mktemp --suffix=.deb)
+    if curl -fsSL -m 180 -o "$deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+       && DEBIAN_FRONTEND=noninteractive timeout 300 apt-get -y install "$deb" >&2 \
+       && command -v google-chrome-stable >/dev/null 2>&1; then
+      rm -f "$deb"
+    else
+      rm -f "$deb"; say "Chrome install failed (dl.google.com unreachable, or apt lock held)"; return 1
+    fi
   fi
 
   if (( ${#archive[@]} )); then

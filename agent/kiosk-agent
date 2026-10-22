@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.20"
+AGENT_VERSION="2.21"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -143,12 +143,13 @@ build_status() {
           rtcWakeSupported:$rtc, wolMac:(if $wm == "" then null else $wm end), wolEnabled:$we}'
 }
 
-# Install what a Web kiosk screen needs. The BROWSER is real Chromium from the xtradeb PPA (NOT a
-# snap, and NOT the archive's Falkon, whose 2020-era engine modern sites like claude.ai reject). The
-# rest are plain archive .debs: a tiny WM (matchbox) for the maintenance window, plus the hidden
-# display + web-VNC stack (xvfb/x11vnc/websockify/novnc), front-loaded here so the first
-# maintenance-on is instant. All bounded by `timeout` so a slow mirror can delay but never wedge the
-# agent. A no-op once everything is present.
+# Install what a Web kiosk screen needs. The BROWSER is Google Chrome: a real, UNCONFINED .deb. This
+# matters - the snap chromium is confined and IGNORES --user-data-dir, which collapsed the display +
+# maintenance profiles into one (the login then jumped to the physical screen); and the archive's
+# Falkon is a 2020-era engine modern sites reject. The rest are plain archive .debs: a tiny WM
+# (matchbox) for the maintenance window, plus the hidden display + web-VNC stack
+# (xvfb/x11vnc/websockify/novnc), front-loaded so the first maintenance-on is instant. All bounded by
+# `timeout` so a slow mirror can delay but never wedge the agent. A no-op once everything is present.
 ensure_webkiosk_browser() {
   local archive=()
   command -v matchbox-window-manager >/dev/null 2>&1 || archive+=(matchbox-window-manager)
@@ -157,21 +158,14 @@ ensure_webkiosk_browser() {
   command -v websockify >/dev/null 2>&1 || archive+=(websockify)
   [[ -d /usr/share/novnc ]] || archive+=(novnc)
 
-  local need_chromium=0
-  command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 || need_chromium=1
+  local need_chrome=0
+  command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || need_chrome=1
 
-  [[ ${#archive[@]} -eq 0 && $need_chromium -eq 0 ]] && return 0
+  [[ ${#archive[@]} -eq 0 && $need_chrome -eq 0 ]] && return 0
 
-  if (( need_chromium )); then
-    log "web kiosk: installing real Chromium from the xtradeb PPA (no snap)..."
-    DEBIAN_FRONTEND=noninteractive timeout 600 bash -c '
-      apt-get update &&
-      apt-get -y install --no-install-recommends software-properties-common &&
-      add-apt-repository -y ppa:xtradeb/apps &&
-      apt-get update &&
-      apt-get -y install --no-install-recommends chromium' >/dev/null 2>&1 \
-      && log "web kiosk: chromium installed" \
-      || log "web kiosk: chromium install failed (PPA unreachable / apt lock) - will retry on the next apply"
+  if (( need_chrome )); then
+    log "web kiosk: installing Google Chrome (real .deb, no snap)..."
+    install_chrome
   fi
 
   if (( ${#archive[@]} )); then
@@ -181,6 +175,21 @@ ensure_webkiosk_browser() {
       >/dev/null 2>&1 && log "web kiosk: installed ${archive[*]}" \
       || log "web kiosk: archive dep install failed/timed out - will retry on the next apply"
   fi
+}
+
+# Install Google Chrome from Google's own .deb (which also adds its apt repo for future auto-updates),
+# and purge the confined snap chromium if present. Quiet (agent context); bounded by timeout.
+install_chrome() {
+  snap remove --purge chromium >/dev/null 2>&1 || true
+  local deb; deb=$(mktemp --suffix=.deb)
+  if curl -fsSL -m 180 -o "$deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+     && DEBIAN_FRONTEND=noninteractive timeout 300 apt-get -y install "$deb" >/dev/null 2>&1 \
+     && command -v google-chrome-stable >/dev/null 2>&1; then
+    log "web kiosk: Google Chrome installed"
+  else
+    log "web kiosk: Chrome install failed (dl.google.com unreachable / apt lock) - will retry on the next apply"
+  fi
+  rm -f "$deb"
 }
 
 apply_config() {

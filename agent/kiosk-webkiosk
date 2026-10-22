@@ -58,11 +58,12 @@ MANAGER_URL=""
 source /etc/kiosk/kiosk.conf 2>/dev/null || true   # MANAGER_URL (+ KIOSK_USER/HOME)
 _resolve_placeholders
 
-# Preferred browser: real Chromium (current engine from the xtradeb PPA - modern sites like claude.ai
-# reject the archive's 2020-era Falkon). Falkon is only a last-resort fallback now.
+# Preferred browser: Google Chrome (real .deb, modern engine, UNCONFINED - unlike the snap chromium,
+# which ignores --user-data-dir and so collapsed the display + maintenance profiles into one, and
+# unlike the archive's 2020-era Falkon which modern sites reject). Others are fallbacks only.
 browser_bin() {
   local b
-  for b in chromium chromium-browser falkon; do
+  for b in google-chrome-stable google-chrome chromium chromium-browser falkon; do
     command -v "$b" >/dev/null 2>&1 && { echo "$b"; return 0; }
   done
   echo ""
