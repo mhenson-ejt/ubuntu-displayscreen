@@ -59,10 +59,11 @@ ensure_deps() {
   command -v websockify >/dev/null 2>&1 || need+=(websockify)   # web VNC (noVNC in a browser)
   [[ -d /usr/share/novnc ]] || need+=(novnc)
   [[ ${#need[@]} -eq 0 ]] && return 0
-  say "installing ${need[*]} (archive .debs, no snap)..."
-  DEBIAN_FRONTEND=noninteractive timeout 480 sh -c \
-    "apt-get -o Acquire::Retries=2 -qq update && apt-get -o Acquire::Retries=2 -y install --no-install-recommends ${need[*]}" \
-    >/dev/null 2>&1 || { say "dependency install failed/timed out"; return 1; }
+  say "installing ${need[*]} (archive .debs, no snap; falkon pulls QtWebEngine so this can take a few minutes)..."
+  # Output goes to stderr (visible when run by hand; the agent captures only the WEBVNC line on stdout).
+  DEBIAN_FRONTEND=noninteractive timeout 600 sh -c \
+    "apt-get -o Acquire::Retries=2 update && apt-get -o Acquire::Retries=2 -y install --no-install-recommends ${need[*]}" \
+    >&2 || { say "dependency install failed/timed out (lock held, or a slow/unreachable mirror)"; return 1; }
 }
 
 screen_res() {   # WxH of the PHYSICAL display, 1920x1080 fallback
