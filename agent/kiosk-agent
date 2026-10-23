@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.24"
+AGENT_VERSION="2.25"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -219,15 +219,20 @@ apply_config() {
   install -m 640 -o root -g "$KIOSK_USER" "$out" "$CONF_DIR/config.json"
   rm -f "$out"
 
-  # Fleet WiFi (wifiSsid/wifiPassword; nullable, additive - older managers never
-  # send them). kiosk-apply-wifi is idempotent (no netplan churn when unchanged)
-  # and keeps wired preferred via route metric; blank/absent SSID clears it.
+  # WiFi (wifiSsid/wifiPassword + wifiSsidFallback/wifiPasswordFallback; all nullable, additive -
+  # older managers never send them). The manager resolves Global->Site->Screen and sends the final
+  # main + fallback; the agent writes BOTH into netplan so a wrong/unreachable main can't strand the
+  # screen. kiosk-apply-wifi is idempotent (no netplan churn when unchanged), keeps wired preferred
+  # via route metric; blank/absent main SSID clears it.
   if command -v kiosk-apply-wifi >/dev/null 2>&1; then
-    local wifi_ssid wifi_pass
+    local wifi_ssid wifi_pass wifi_fb_ssid wifi_fb_pass
     wifi_ssid=$(jq -r '.wifiSsid // empty' "$CONF_DIR/config.json")
     wifi_pass=$(jq -r '.wifiPassword // empty' "$CONF_DIR/config.json")
+    wifi_fb_ssid=$(jq -r '.wifiSsidFallback // empty' "$CONF_DIR/config.json")
+    wifi_fb_pass=$(jq -r '.wifiPasswordFallback // empty' "$CONF_DIR/config.json")
     if [[ -n $wifi_ssid ]]; then
-      kiosk-apply-wifi "$wifi_ssid" "$wifi_pass" || log "wifi: apply failed - display continues on current network"
+      kiosk-apply-wifi "$wifi_ssid" "$wifi_pass" "$wifi_fb_ssid" "$wifi_fb_pass" \
+        || log "wifi: apply failed - display continues on current network"
     else
       kiosk-apply-wifi --clear || true
     fi

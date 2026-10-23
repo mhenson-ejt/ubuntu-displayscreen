@@ -3,7 +3,10 @@
 # kiosk-apply-wifi - configures the screen's WiFi network via netplan
 #
 # Usage:
-#   kiosk-apply-wifi SSID [PSK]     configure (open network if PSK omitted)
+#   kiosk-apply-wifi SSID [PSK] [FALLBACK_SSID] [FALLBACK_PSK]
+#       configure (open network if a PSK is empty). Both SSIDs are written as
+#       netplan access-points, so the screen connects to whichever is in range -
+#       a wrong/unreachable main SSID can't strand it as long as the fallback is.
 #   kiosk-apply-wifi --clear        remove the WiFi config
 #
 # Design: the WiFi is configured PERMANENTLY with a worse route metric than
@@ -68,13 +71,17 @@ fi
 
 SSID=${1:-}
 PSK=${2:-}
-[[ -n $SSID ]] || { log "usage: kiosk-apply-wifi SSID [PSK] | --clear"; exit 1; }
+FB_SSID=${3:-}
+FB_PSK=${4:-}
+[[ -n $SSID ]] || { log "usage: kiosk-apply-wifi SSID [PSK] [FALLBACK_SSID] [FALLBACK_PSK] | --clear"; exit 1; }
 
-# WPA-PSK passphrases must be 8-63 characters; refuse rather than write a
-# config wpa_supplicant will reject
-if [[ -n $PSK && ( ${#PSK} -lt 8 || ${#PSK} -gt 63 ) ]]; then
-  log "refusing: WiFi password must be 8-63 characters"
-  exit 1
+# WPA-PSK passphrases must be 8-63 characters; refuse rather than write a config wpa_supplicant
+# rejects. A too-long/short fallback is dropped (not fatal) so a bad fallback never blocks the main.
+validate_psk() { [[ -z $1 ]] && return 0; { [[ ${#1} -ge 8 && ${#1} -le 63 ]]; }; }
+if ! validate_psk "$PSK"; then log "refusing: WiFi password must be 8-63 characters"; exit 1; fi
+if [[ -n $FB_SSID ]] && ! validate_psk "$FB_PSK"; then
+  log "fallback WiFi password invalid (8-63 chars) - ignoring the fallback SSID"
+  FB_SSID=""; FB_PSK=""
 fi
 
 # netplan's networkd backend requires WiFi devices by literal interface name (match: is not
@@ -96,6 +103,18 @@ log "using WiFi interface $WLAN"
 # escape for double-quoted YAML scalars
 esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+# emit one access-point entry (open network if the PSK is empty); skips an empty SSID
+emit_ap() {
+  local s=$1 p=$2
+  [[ -z $s ]] && return 0
+  if [[ -n $p ]]; then
+    echo "        \"$(esc "$s")\":"
+    echo "          password: \"$(esc "$p")\""
+  else
+    echo "        \"$(esc "$s")\": {}"
+  fi
+}
+
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
@@ -111,12 +130,9 @@ trap 'rm -f "$TMP"' EXIT
   echo "        route-metric: 4096"
   echo "      optional: true"
   echo "      access-points:"
-  if [[ -n $PSK ]]; then
-    echo "        \"$(esc "$SSID")\":"
-    echo "          password: \"$(esc "$PSK")\""
-  else
-    echo "        \"$(esc "$SSID")\": {}"
-  fi
+  emit_ap "$SSID" "$PSK"
+  # Fallback AP: netplan/wpa_supplicant joins whichever SSID is in range, so a bad main can't strand.
+  [[ -n $FB_SSID && $FB_SSID != "$SSID" ]] && emit_ap "$FB_SSID" "$FB_PSK"
 } > "$TMP"
 
 if [[ -f $YAML ]] && cmp -s "$TMP" "$YAML"; then
@@ -128,7 +144,7 @@ install -m 600 -o root -g root "$TMP" "$YAML"
 
 if netplan apply 2>&1; then
   install_wait_online_any
-  log "WiFi configured for \"$SSID\" (wired stays preferred when connected)"
+  log "WiFi configured for \"$SSID\"${FB_SSID:+ + fallback \"$FB_SSID\"} (wired stays preferred when connected)"
 else
   # a bad apply must not leave a broken file for the next boot
   rm -f "$YAML"
