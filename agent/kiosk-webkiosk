@@ -222,6 +222,29 @@ chromium_prep() {
   [[ -f $prefs ]] && sed -i 's/"exited_cleanly":false/"exited_cleanly":true/g; s/"exit_type":"[^"]*"/"exit_type":"Normal"/g' "$prefs" 2>/dev/null || true
 }
 
+# _fit_chromium_window -> size the real Chromium page window to the whole screen and move it to 0,0.
+# WHY this is needed: --kiosk only asks the window manager for full-screen, and these boxes run a bare X
+# whose only WM (matchbox) is often not even installed/running - so without this the window comes up at a
+# default ~half size (the "half a screen" bug on wk-204). So we drive it directly, exactly like the camera
+# wall drives mpv and _launch_falkon drives Falkon. Chromium spawns several top-level X windows (a stray
+# "google-chrome-stable" window, a clipboard window); only the real page window has WM_CLASS *exactly*
+# "Google-chrome", so match it anchored (^...$) to skip the strays. Harmless no-op if xdotool is missing.
+_fit_chromium_window() {
+  command -v xdotool >/dev/null 2>&1 || return 0
+  local dims w h wid i
+  dims=$(screen_dims); w=${dims%% *}; h=${dims##* }
+  [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] || return 0
+  for i in $(seq 1 30); do
+    wid=$(xdotool search --onlyvisible --class '^Google-chrome$' 2>/dev/null | tail -1)
+    [[ -n $wid ]] && break
+    sleep 0.5
+  done
+  [[ -z ${wid:-} ]] && { say "chromium window not found via xdotool - page may not fill the screen"; return 0; }
+  xdotool windowsize "$wid" "$w" "$h" 2>/dev/null || true
+  xdotool windowmove "$wid" 0 0 2>/dev/null || true
+  BROWSER_WID=$wid
+}
+
 _launch_chromium() {   # _launch_chromium BIN TARGET
   local bin=$1 target=$2
   # NOT --incognito: the kiosk keeps a persistent profile so logins (done in a maintenance session on
@@ -234,8 +257,9 @@ _launch_chromium() {   # _launch_chromium BIN TARGET
     --overscroll-history-navigation=0 --check-for-update-interval=31536000 --password-store=basic \
     --user-data-dir="$KIOSK_CHROMIUM_DIR" --disable-gpu --disable-dev-shm-usage --app="$target" >/dev/null 2>&1 &
   BROWSER_PID=$!
-  BROWSER_WID=""   # Chromium --kiosk is already full-screen chromeless; no xdotool needed
+  BROWSER_WID=""
   say "showing $target (chromium pid $BROWSER_PID)"
+  _fit_chromium_window   # --kiosk alone doesn't fill the screen on these WM-less boxes; force it
 }
 
 refresh_page() {   # send a reload (F5) to the kiosk window
@@ -264,6 +288,7 @@ launch_placeholder_browser() {
   fi
   PLACEHOLDER_PID=$!
   say "maintenance: showing placeholder on the physical screen (pid $PLACEHOLDER_PID)"
+  [[ $bin != falkon ]] && _fit_chromium_window   # same WM-less full-screen fix as the live kiosk
 }
 
 # Sourced by the test harness, which stubs the helpers and drives them directly.
