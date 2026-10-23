@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.26"
+AGENT_VERSION="2.27"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -162,6 +162,11 @@ ensure_webkiosk_browser() {
   command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || need_chrome=1
 
   [[ ${#archive[@]} -eq 0 && $need_chrome -eq 0 ]] && return 0
+
+  # A prior install killed mid-configure (our own timeout, or a boot-time apt run) leaves dpkg half-done,
+  # and then every later apt install aborts in ~1s with "dpkg was interrupted". Heal it first:
+  # apt-get install -f runs dpkg --configure -a natively, honours the lock timeout, near no-op when clean.
+  DEBIAN_FRONTEND=noninteractive timeout 360 apt-get -o DPkg::Lock::Timeout=300 -y install -f >/dev/null 2>&1 || true
 
   if (( need_chrome )); then
     log "web kiosk: installing Google Chrome (real .deb, no snap)..."

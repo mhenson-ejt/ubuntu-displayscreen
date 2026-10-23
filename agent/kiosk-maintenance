@@ -93,6 +93,12 @@ ensure_deps() {
 
   [[ ${#archive[@]} -eq 0 && $need_chrome -eq 0 ]] && return 0
 
+  # A prior install killed mid-configure (e.g. by our own timeout, or a boot-time apt run) leaves dpkg
+  # half-done, and then EVERY later apt install aborts in ~1s with "dpkg was interrupted". Heal it first:
+  # apt-get install -f runs dpkg --configure -a natively, honours the lock timeout, and is a near no-op
+  # when the state is clean.
+  DEBIAN_FRONTEND=noninteractive timeout 360 apt-get -o DPkg::Lock::Timeout=300 -y install -f >&2 2>&1 || true
+
   # Output goes to stderr (visible when run by hand; the agent captures only the WEBVNC line on stdout).
   if (( need_chrome )); then
     say "installing Google Chrome (real .deb, no snap; the snap is confined and ignores --user-data-dir)..."
