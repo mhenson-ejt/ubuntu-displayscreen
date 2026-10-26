@@ -37,6 +37,10 @@ MAINT_YIELDED="$MAINT_DIR/maintenance-yielded"
 # the shared one.
 KIOSK_CHROMIUM_DIR=${KIOSK_CHROMIUM_DIR:-$HOME/.config/kiosk-chromium}
 
+# Downloaded videos for web-kiosk video pages, cached by media id so a reboot/relaunch doesn't refetch
+# a large file. Under the kiosk user's HOME (webkiosk.sh runs as that user; /var/lib isn't writable to it).
+MEDIA_CACHE=${KIOSK_MEDIA_CACHE:-$HOME/.cache/kiosk-media}
+
 say() { logger -t kiosk-webkiosk -- "$*" 2>/dev/null; echo "kiosk-webkiosk: $*" >&2; }
 
 # The placeholder pages are served over HTTP by the manager (the URL the agent already syncs with) so
@@ -98,8 +102,8 @@ read_cfg() {
   REFRESH=$(jq -r '.webKiosk.refreshSeconds // empty' "$CONFIG" 2>/dev/null || true)
   [[ $REFRESH =~ ^[0-9]+$ ]] || REFRESH=""
 
-  URLS=(); DWELLS=()
-  local i=0 u d
+  URLS=(); DWELLS=(); KINDS=()
+  local i=0 u d k
   while :; do
     u=$(jq -r ".webKiosk.pages[$i].url // empty" "$CONFIG" 2>/dev/null || true)
     [[ -z $u ]] && break
@@ -107,10 +111,21 @@ read_cfg() {
     d=$(jq -r ".webKiosk.pages[$i].dwellSeconds // 30" "$CONFIG" 2>/dev/null || echo 30)
     { [[ $d =~ ^[0-9]+$ ]] && (( d >= 5 )); } || d=30
     DWELLS+=("$d")
+    # kind: 1 = web page (browser), 2 = video (mpv). Default 1 for payloads from an older manager.
+    k=$(jq -r ".webKiosk.pages[$i].kind // 1" "$CONFIG" 2>/dev/null || echo 1)
+    [[ $k == 2 ]] || k=1
+    KINDS+=("$k")
     i=$((i + 1))
   done
   NPAGES=${#URLS[@]}
   URL=${URLS[0]:-}
+}
+
+# A video page's URL is the manager's media route; it may be stored relative (/kiosk/media/{id}), so
+# resolve it against the manager base the same way the placeholders are resolved.
+_resolve_media() {
+  local u=$1
+  [[ $u == /* ]] && echo "${MANAGER_URL%/}$u" || echo "$u"
 }
 
 # reachable URL -> 0 if the page responds (HEAD, then GET for servers that refuse HEAD)
@@ -131,11 +146,25 @@ target_at() {
     return
   fi
   u=${URLS[$idx]}
+  # A video page's URL is the manager media route (maybe relative) - resolve it to an absolute URL so
+  # the reachability check and the player get the real address.
+  [[ ${KINDS[$idx]:-1} == 2 ]] && u=$(_resolve_media "$u")
   if reachable "$u"; then
     echo "$u"
   else
     echo "$PLACEHOLDER_UNREACHABLE_TARGET"
   fi
+}
+
+# target_is_video TARGET IDX -> 0 when page IDX is a video AND its target is the real media URL (not a
+# placeholder shown because the media was unreachable - those are ordinary web pages).
+target_is_video() {
+  local t=$1 idx=$2
+  [[ ${KINDS[$idx]:-1} == 2 ]] || return 1
+  case $t in
+    "$PLACEHOLDER_DEFAULT_TARGET"|"$PLACEHOLDER_UNREACHABLE_TARGET"|"$PLACEHOLDER_MAINTENANCE_TARGET") return 1 ;;
+  esac
+  return 0
 }
 
 # choose_target -> target for the first/only page (single-URL path; used by the supervise loop when a
@@ -144,6 +173,17 @@ choose_target() { target_at 0; }
 
 launch_browser() {   # launch_browser TARGET -> sets BROWSER_PID, BROWSER_KIND (and BROWSER_WID for Falkon)
   local target=$1 bin
+
+  # A video page plays with mpv, not a browser (BROWSER_PID still tracks it so the supervise loop's
+  # crash/maintenance handling is unchanged). Checked first so it works even if no browser is installed.
+  if target_is_video "$target" "${cur:-0}"; then
+    if [[ -n ${KIOSK_DRYRUN:-} ]]; then
+      echo "video: $target"; BROWSER_PID=0; BROWSER_KIND=mpv; BROWSER_WID=""; return 0
+    fi
+    _launch_video "$target"
+    return $?
+  fi
+
   bin=$(browser_bin)
   if [[ -z $bin ]]; then say "no browser installed (falkon/chromium) - cannot show web kiosk"; return 1; fi
   BROWSER_KIND=$bin
@@ -170,6 +210,14 @@ navigate() {
     echo "navigate: $target"
     return 0
   fi
+  # Can't navigate in place to/from a video (mpv has no "open this URL in the running window", and the
+  # player type changes): kill the current player and relaunch via launch_browser, which picks mpv/browser.
+  if target_is_video "$target" "${cur:-0}" || [[ ${BROWSER_KIND:-} == mpv ]]; then
+    kill "$BROWSER_PID" 2>/dev/null || true
+    wait "$BROWSER_PID" 2>/dev/null || true
+    launch_browser "$target"
+    return
+  fi
   if [[ ${BROWSER_KIND:-} == falkon ]]; then
     falkon --profile kiosk --current-tab "$target" >/dev/null 2>&1 &
   else
@@ -177,6 +225,42 @@ navigate() {
     wait "$BROWSER_PID" 2>/dev/null || true
     _launch_chromium "${BROWSER_KIND:-chromium}" "$target"
   fi
+}
+
+# _fetch_media URL -> prints the local cached path, downloading once (cached by media id so a relaunch
+# or reboot doesn't refetch). Returns non-zero if the download fails.
+_fetch_media() {
+  local url=$1 id local tmp
+  id=$(basename "${url%%\?*}")
+  [[ $id == *.mp4 ]] || id="$id.mp4"
+  local="$MEDIA_CACHE/$id"
+  if [[ -s $local ]]; then echo "$local"; return 0; fi
+  mkdir -p "$MEDIA_CACHE" 2>/dev/null || true
+  tmp="$local.part"
+  if curl -fsSL -m 600 -o "$tmp" "$url" 2>/dev/null && [[ -s $tmp ]]; then
+    mv -f "$tmp" "$local"; echo "$local"; return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+# _launch_video RESOLVED_URL -> download + play the MP4 full-screen WITH sound, looping. Sets BROWSER_*.
+# Mirrors the camera wall's mpv (borderless window placed by --geometry on the bare, WM-less X), but with
+# audio on and the file looped. Audio uses mpv's default sink unless KIOSK_AUDIO_DEVICE overrides it.
+_launch_video() {
+  local url=$1 dims w h local
+  if ! command -v mpv >/dev/null 2>&1; then say "mpv not installed - cannot play video page"; return 1; fi
+  local=$(_fetch_media "$url") || { say "video download failed ($url)"; return 1; }
+  dims=$(screen_dims); w=${dims%% *}; h=${dims##* }
+  mpv --no-osc --no-input-default-bindings --no-input-terminal --no-border --force-window=immediate \
+      --geometry="${w}x${h}+0+0" --autofit="${w}x${h}" --ontop \
+      --loop-file=inf --keep-open=yes --hwdec=auto --cache=yes --volume=100 \
+      ${KIOSK_AUDIO_DEVICE:+--audio-device="$KIOSK_AUDIO_DEVICE"} \
+      "$local" >/dev/null 2>&1 &
+  BROWSER_PID=$!
+  BROWSER_KIND=mpv
+  BROWSER_WID=""
+  say "playing video $url (mpv pid $BROWSER_PID)"
 }
 
 _launch_falkon() {   # Falkon in a dedicated profile, forced full-screen with xdotool
@@ -264,6 +348,7 @@ _launch_chromium() {   # _launch_chromium BIN TARGET
 
 refresh_page() {   # send a reload (F5) to the kiosk window
   [[ -n ${KIOSK_DRYRUN:-} ]] && { echo "refresh"; return; }
+  [[ ${BROWSER_KIND:-} == mpv ]] && return 0   # a looping video has nothing to refresh
   command -v xdotool >/dev/null 2>&1 || return 0
   [[ -n ${BROWSER_WID:-} ]] && xdotool windowfocus "$BROWSER_WID" 2>/dev/null || true
   xdotool key --clearmodifiers F5 2>/dev/null || true

@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.28"
+AGENT_VERSION="2.29"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -157,6 +157,7 @@ ensure_webkiosk_browser() {
   command -v x11vnc >/dev/null 2>&1 || archive+=(x11vnc)
   command -v websockify >/dev/null 2>&1 || archive+=(websockify)
   [[ -d /usr/share/novnc ]] || archive+=(novnc)
+  command -v mpv >/dev/null 2>&1 || archive+=(mpv)   # video-page playback (also the camera-wall player)
 
   local need_chrome=0
   command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || need_chrome=1
