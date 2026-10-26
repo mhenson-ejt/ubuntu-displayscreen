@@ -244,23 +244,46 @@ _fetch_media() {
   return 1
 }
 
+# _detect_hdmi_audio -> print the ALSA HDMI output that has a TV connected, or nothing. These boxes run
+# bare ALSA (no PulseAudio), so mpv's default sink is the ANALOG card and HDMI gets no sound. Each HDMI
+# port is its own ALSA device; mpv labels the one with a connected display by the monitor's name (e.g.
+# "SAMSUNG/HDMI Audio Output") and the empty ports generically ("HDMI 1/HDMI Audio Output"). So pick the
+# hdmi device whose description is NOT that generic "HDMI <n>/HDMI Audio Output" form. Device ids differ
+# per box (CARD=PCH vs CARD=HDMI), which is why we detect rather than hardcode. Nothing connected -> no
+# output (mpv falls back to default; a screen with no HDMI audio sink, e.g. a plain monitor, stays silent).
+_detect_hdmi_audio() {
+  command -v mpv >/dev/null 2>&1 || return 1
+  local line dev desc
+  while IFS= read -r line; do
+    [[ $line == *"alsa/hdmi:CARD="* ]] || continue
+    dev=${line#*\'}; dev=${dev%%\'*}
+    desc=${line#*\(}; desc=${desc%\)*}
+    [[ $desc == *"HDMI "[0-9]"/HDMI Audio Output"* ]] && continue   # generic/empty port
+    echo "$dev"; return 0
+  done < <(mpv --audio-device=help 2>/dev/null)
+  return 1
+}
+
 # _launch_video RESOLVED_URL -> download + play the MP4 full-screen WITH sound, looping. Sets BROWSER_*.
 # Mirrors the camera wall's mpv (borderless window placed by --geometry on the bare, WM-less X), but with
-# audio on and the file looped. Audio uses mpv's default sink unless KIOSK_AUDIO_DEVICE overrides it.
+# audio on and the file looped. Audio device: KIOSK_AUDIO_DEVICE override, else the auto-detected HDMI
+# sink (the connected TV), else mpv's default.
 _launch_video() {
-  local url=$1 dims w h local
+  local url=$1 dims w h local adev
   if ! command -v mpv >/dev/null 2>&1; then say "mpv not installed - cannot play video page"; return 1; fi
   local=$(_fetch_media "$url") || { say "video download failed ($url)"; return 1; }
   dims=$(screen_dims); w=${dims%% *}; h=${dims##* }
+  adev=${KIOSK_AUDIO_DEVICE:-}
+  [[ -z $adev ]] && adev=$(_detect_hdmi_audio) || true
   mpv --no-osc --no-input-default-bindings --no-input-terminal --no-border --force-window=immediate \
       --geometry="${w}x${h}+0+0" --autofit="${w}x${h}" --ontop \
       --loop-file=inf --keep-open=yes --hwdec=auto --cache=yes --volume=100 \
-      ${KIOSK_AUDIO_DEVICE:+--audio-device="$KIOSK_AUDIO_DEVICE"} \
+      ${adev:+--audio-device="$adev"} \
       "$local" >/dev/null 2>&1 &
   BROWSER_PID=$!
   BROWSER_KIND=mpv
   BROWSER_WID=""
-  say "playing video $url (mpv pid $BROWSER_PID)"
+  say "playing video $url (mpv pid $BROWSER_PID${adev:+, audio $adev})"
 }
 
 _launch_falkon() {   # Falkon in a dedicated profile, forced full-screen with xdotool
