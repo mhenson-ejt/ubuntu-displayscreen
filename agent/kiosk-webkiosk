@@ -41,6 +41,11 @@ KIOSK_CHROMIUM_DIR=${KIOSK_CHROMIUM_DIR:-$HOME/.config/kiosk-chromium}
 # a large file. Under the kiosk user's HOME (webkiosk.sh runs as that user; /var/lib isn't writable to it).
 MEDIA_CACHE=${KIOSK_MEDIA_CACHE:-$HOME/.cache/kiosk-media}
 
+# mpv JSON-IPC socket for the playing video, so the manager's play/pause/restart commands can drive it.
+# In /tmp (world-writable; the kiosk user's mpv creates it, the root agent connects) - same place the
+# camera wall puts its per-tile sockets. Must match VIDEO_SOCK in kiosk-agent.
+VIDEO_SOCK=${KIOSK_VIDEO_SOCK:-/tmp/kiosk-video.sock}
+
 say() { logger -t kiosk-webkiosk -- "$*" 2>/dev/null; echo "kiosk-webkiosk: $*" >&2; }
 
 # The placeholder pages are served over HTTP by the manager (the URL the agent already syncs with) so
@@ -102,8 +107,8 @@ read_cfg() {
   REFRESH=$(jq -r '.webKiosk.refreshSeconds // empty' "$CONFIG" 2>/dev/null || true)
   [[ $REFRESH =~ ^[0-9]+$ ]] || REFRESH=""
 
-  URLS=(); DWELLS=(); KINDS=()
-  local i=0 u d k
+  URLS=(); DWELLS=(); KINDS=(); AUTOPLAYS=()
+  local i=0 u d k a
   while :; do
     u=$(jq -r ".webKiosk.pages[$i].url // empty" "$CONFIG" 2>/dev/null || true)
     [[ -z $u ]] && break
@@ -115,6 +120,10 @@ read_cfg() {
     k=$(jq -r ".webKiosk.pages[$i].kind // 1" "$CONFIG" 2>/dev/null || echo 1)
     [[ $k == 2 ]] || k=1
     KINDS+=("$k")
+    # autoplay (video pages): true = play on load, false = start paused until a play command. Default true.
+    a=$(jq -r ".webKiosk.pages[$i].autoplay // true" "$CONFIG" 2>/dev/null || echo true)
+    [[ $a == false ]] || a=true
+    AUTOPLAYS+=("$a")
     i=$((i + 1))
   done
   NPAGES=${#URLS[@]}
@@ -269,21 +278,25 @@ _detect_hdmi_audio() {
 # audio on and the file looped. Audio device: KIOSK_AUDIO_DEVICE override, else the auto-detected HDMI
 # sink (the connected TV), else mpv's default.
 _launch_video() {
-  local url=$1 dims w h local adev
+  local url=$1 dims w h local adev paused=
   if ! command -v mpv >/dev/null 2>&1; then say "mpv not installed - cannot play video page"; return 1; fi
   local=$(_fetch_media "$url") || { say "video download failed ($url)"; return 1; }
   dims=$(screen_dims); w=${dims%% *}; h=${dims##* }
   adev=${KIOSK_AUDIO_DEVICE:-}
   [[ -z $adev ]] && adev=$(_detect_hdmi_audio) || true
+  # Autoplay off for this page -> start paused (a still first frame) until a play command arrives.
+  [[ ${AUTOPLAYS[${cur:-0}]:-true} == false ]] && paused=yes
+  rm -f "$VIDEO_SOCK" 2>/dev/null || true
   mpv --no-osc --no-input-default-bindings --no-input-terminal --no-border --force-window=immediate \
       --geometry="${w}x${h}+0+0" --autofit="${w}x${h}" --ontop \
       --loop-file=inf --keep-open=yes --hwdec=auto --cache=yes --volume=100 \
+      --input-ipc-server="$VIDEO_SOCK" ${paused:+--pause=yes} \
       ${adev:+--audio-device="$adev"} \
       "$local" >/dev/null 2>&1 &
   BROWSER_PID=$!
   BROWSER_KIND=mpv
   BROWSER_WID=""
-  say "playing video $url (mpv pid $BROWSER_PID${adev:+, audio $adev})"
+  say "playing video $url (mpv pid $BROWSER_PID${adev:+, audio $adev}${paused:+, paused: autoplay off})"
 }
 
 _launch_falkon() {   # Falkon in a dedicated profile, forced full-screen with xdotool

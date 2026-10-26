@@ -30,7 +30,7 @@
 #===============================================================================
 set -uo pipefail
 
-AGENT_VERSION="2.30"
+AGENT_VERSION="2.31"
 ENV_FILE=/etc/kiosk/agent.env
 CONF_DIR=/etc/kiosk
 POLL_INTERVAL=15
@@ -454,6 +454,24 @@ ack() { # ack COMMAND_ID RESULT MESSAGE
   rm -f "$out"
 }
 
+# mpv JSON-IPC socket for the playing web-kiosk video (set by kiosk-webkiosk _launch_video). Must match.
+VIDEO_SOCK=${KIOSK_VIDEO_SOCK:-/tmp/kiosk-video.sock}
+
+# _video_ipc JSON -> send one command to the running video mpv over its IPC socket. 0 on success, 1 if
+# nothing is playing / the socket is gone. python3 is already required for the camera-wall IPC.
+_video_ipc() {
+  [[ -S $VIDEO_SOCK ]] || return 1
+  python3 - "$VIDEO_SOCK" "$1" <<'PY' 2>/dev/null
+import socket, sys
+sock, js = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX); s.settimeout(2)
+try:
+    s.connect(sock); s.sendall(js.encode() + b"\n")
+except OSError:
+    sys.exit(1)
+PY
+}
+
 handle_command() {
   local id type
   id=$(jq -r '.id' <<<"$1")
@@ -513,6 +531,23 @@ handle_command() {
           || ack "$id" error "maintenance stop failed"
       else
         ack "$id" error "kiosk-maintenance not installed"
+      fi
+      ;;
+    video-pause)
+      _video_ipc '{"command":["set_property","pause",true]}' \
+        && ack "$id" ok "paused" || ack "$id" error "no video playing"
+      ;;
+    video-play)
+      _video_ipc '{"command":["set_property","pause",false]}' \
+        && ack "$id" ok "playing" || ack "$id" error "no video playing"
+      ;;
+    video-restart)
+      # Jump to the start and make sure it is playing (covers a video paused by autoplay-off).
+      if _video_ipc '{"command":["seek",0,"absolute"]}'; then
+        _video_ipc '{"command":["set_property","pause",false]}'
+        ack "$id" ok "restarted"
+      else
+        ack "$id" error "no video playing"
       fi
       ;;
     *)
